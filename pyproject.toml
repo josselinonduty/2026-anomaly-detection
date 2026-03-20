@@ -1,0 +1,46 @@
+[project]
+name = "stage"
+version = "0.1.0"
+description = "Industrial Anomaly Detection & Spot-the-Difference"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "anomalib>=2.2.0",
+    "huggingface-hub>=1.5.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "onnx>=1.20.1",
+    "onnxscript>=0.6.2",
+    "openvino>=2026.0.0",
+    "pandas<3",
+    "pip>=26.0.1",
+    "pytorch-lightning>=2.5.0,<2.5.6", # see https://github.com/open-edge-platform/anomalib/issues/3092
+    "requests>=2.32.5",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "triton-xpu>=3.6.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-xpu" }
+torchvision = { index = "pytorch-xpu" }
+torchaudio = { index = "pytorch-xpu" }
+pytorch-triton-xpu = { index = "pytorch-xpu" }
+triton-xpu = { index = "pytorch-xpu" }
+anomalib = { path = "../anomalib" }
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
