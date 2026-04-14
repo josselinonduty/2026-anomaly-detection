@@ -11,6 +11,7 @@ Implements the full EfficientAd pipeline (Batzner et al., WACV 2024):
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -539,6 +540,54 @@ class EfficientAdModule(LightningModule):
     # ------------------------------------------------------------------
     # Optimiser & scheduler
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, ckpt_dir: str | Path) -> None:
+        """Persist all weights and normalisation buffers to *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "hparams": dict(self.hparams),
+            "teacher": self.teacher.state_dict(),
+            "student": self.student.state_dict(),
+            "autoencoder": self.autoencoder.state_dict(),
+            "teacher_mean": self.teacher_mean,
+            "teacher_std": self.teacher_std,
+            "q_st_start": self.q_st_start,
+            "q_st_end": self.q_st_end,
+            "q_ae_start": self.q_ae_start,
+            "q_ae_end": self.q_ae_end,
+            "map_norm_ready": self._map_norm_ready,
+            "teacher_ready": self._teacher_ready,
+        }
+        torch.save(state, ckpt_dir / "model.ckpt")
+
+    @classmethod
+    def load_checkpoint(
+        cls, ckpt_dir: str | Path, map_location: str = "cpu"
+    ) -> "EfficientAdModule":
+        """Restore an EfficientAd module from *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        state = torch.load(ckpt_dir / "model.ckpt", map_location=map_location)
+        hparams = state["hparams"]
+        # Avoid re-loading teacher weights from file during __init__
+        hparams["teacher_weights"] = None
+        module = cls(**hparams)
+        module.teacher.load_state_dict(state["teacher"])
+        module.student.load_state_dict(state["student"])
+        module.autoencoder.load_state_dict(state["autoencoder"])
+        module.teacher_mean.copy_(state["teacher_mean"])
+        module.teacher_std.copy_(state["teacher_std"])
+        module.q_st_start.copy_(state["q_st_start"])
+        module.q_st_end.copy_(state["q_st_end"])
+        module.q_ae_start.copy_(state["q_ae_start"])
+        module.q_ae_end.copy_(state["q_ae_end"])
+        module._map_norm_ready = state["map_norm_ready"]
+        module._teacher_ready = state["teacher_ready"]
+        return module
 
     def configure_optimizers(self) -> dict:
         # Only student and autoencoder are trainable (teacher is frozen).

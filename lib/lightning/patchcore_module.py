@@ -10,6 +10,8 @@ Only **one** training epoch is needed.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from pytorch_lightning import LightningModule
 
@@ -180,3 +182,31 @@ class PatchCoreModule(LightningModule):
 
     def configure_optimizers(self) -> None:  # type: ignore[override]
         return None
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, ckpt_dir: str | Path) -> None:
+        """Persist the memory bank and hparams to *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "hparams": dict(self.hparams),
+            "memory_bank": self.model.memory_bank,
+            "fitted": self.model._fitted,
+        }
+        torch.save(state, ckpt_dir / "model.ckpt")
+
+    @classmethod
+    def load_checkpoint(
+        cls, ckpt_dir: str | Path, map_location: str = "cpu"
+    ) -> "PatchCoreModule":
+        """Restore a PatchCore module from *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        state = torch.load(ckpt_dir / "model.ckpt", map_location=map_location)
+        module = cls(**state["hparams"])
+        if state["fitted"]:
+            module.model.memory_bank = state["memory_bank"]
+            module.model._fitted = True
+        return module

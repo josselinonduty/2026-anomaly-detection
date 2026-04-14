@@ -17,7 +17,7 @@ import mlflow
 import pytorch_lightning as pl
 import torch
 from codecarbon import EmissionsTracker
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import MLFlowLogger
 from pytorch_lightning.strategies import SingleDeviceStrategy
 
@@ -34,6 +34,7 @@ from lib.lightning import (
     PatchCoreModule,
 )
 from lib.lightning.callbacks import InferenceSpeedMonitor, MemoryMonitor
+from lib.utils.checkpoint import make_checkpoint_dir, save_metadata
 
 
 def parse_args() -> argparse.Namespace:
@@ -244,18 +245,8 @@ def main() -> None:
         raise ValueError(msg)
 
     # ── Callbacks ────────────────────────────────────────────────────
-    checkpoint_dir = Path("checkpoints") / args.category
     callbacks = [InferenceSpeedMonitor(), MemoryMonitor()]
     if args.model == "autoencoder":
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=str(checkpoint_dir),
-                filename="best-{epoch}-{val/loss:.4f}",
-                monitor="val/loss",
-                mode="min",
-                save_top_k=1,
-            )
-        )
         callbacks.append(
             EarlyStopping(
                 monitor="val/loss",
@@ -313,8 +304,18 @@ def main() -> None:
         if emissions is not None:
             mlflow_logger.log_metrics({"carbon/emissions_kg": emissions})
 
+    # ── Save checkpoint ──────────────────────────────────────────────
+    ckpt_dir = make_checkpoint_dir("checkpoints", args.model, args.category)
+    model.save_checkpoint(ckpt_dir)
+    save_metadata(
+        ckpt_dir,
+        model_name=args.model,
+        category=args.category,
+        extra={k: str(v) for k, v in vars(args).items()},
+    )
+
     print(f"\n✓ Training complete for category '{args.category}'.")
-    print(f"  Checkpoints saved to: {checkpoint_dir.resolve()}")
+    print(f"  Checkpoint saved to: {ckpt_dir.resolve()}")
     print(f"  MLflow UI: mlflow ui --backend-store-uri {args.tracking_uri}")
 
 

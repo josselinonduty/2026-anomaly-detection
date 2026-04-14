@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -127,6 +129,31 @@ class AutoencoderModule(LightningModule):
     # ------------------------------------------------------------------
     # Optimiser
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, ckpt_dir: str | Path) -> None:
+        """Persist model weights to *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "hparams": dict(self.hparams),
+            "model_state_dict": self.model.state_dict(),
+        }
+        torch.save(state, ckpt_dir / "model.ckpt")
+
+    @classmethod
+    def load_checkpoint(
+        cls, ckpt_dir: str | Path, map_location: str = "cpu"
+    ) -> "AutoencoderModule":
+        """Restore an Autoencoder module from *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        state = torch.load(ckpt_dir / "model.ckpt", map_location=map_location)
+        module = cls(**state["hparams"])
+        module.model.load_state_dict(state["model_state_dict"])
+        return module
 
     def configure_optimizers(self) -> dict:
         optimizer = torch.optim.AdamW(

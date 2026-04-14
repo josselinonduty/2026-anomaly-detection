@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -344,6 +345,33 @@ class DinomalyModule(LightningModule):
     # ------------------------------------------------------------------
     # Optimiser & scheduler
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, ckpt_dir: str | Path) -> None:
+        """Persist model weights to *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "hparams": dict(self.hparams),
+            "model_state_dict": self.model.state_dict(),
+            "global_iter": self._global_iter,
+        }
+        torch.save(state, ckpt_dir / "model.ckpt")
+
+    @classmethod
+    def load_checkpoint(
+        cls, ckpt_dir: str | Path, map_location: str = "cpu"
+    ) -> "DinomalyModule":
+        """Restore a Dinomaly module from *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        state = torch.load(ckpt_dir / "model.ckpt", map_location=map_location)
+        module = cls(**state["hparams"])
+        module.model.load_state_dict(state["model_state_dict"])
+        module._global_iter = state["global_iter"]
+        return module
 
     def configure_optimizers(self) -> dict:
         trainable = nn.ModuleList([self.model.bottleneck, self.model.decoder])
