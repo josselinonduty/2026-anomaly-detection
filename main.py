@@ -182,6 +182,7 @@ def main() -> None:
     )
 
     # ── Model ────────────────────────────────────────────────────────
+    model: PatchCoreModule | DinomalyModule | EfficientAdModule | AutoencoderModule
     if args.model == "patchcore":
         model = PatchCoreModule(
             coreset_sampling_ratio=args.coreset_sampling_ratio,
