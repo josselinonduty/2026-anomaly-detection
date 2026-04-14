@@ -31,3 +31,4 @@ mlflow.db
 mlflow.db-*
 logs/
 checkpoints/
+output/
