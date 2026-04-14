@@ -18,12 +18,11 @@ wheels/
 .vscode/
 
 # Data
-data/
-datasets/
+/data/
+/datasets/
 logs/
 results/
 pre_trained/
-results/
 
 # Experiment tracking
 mlruns/
