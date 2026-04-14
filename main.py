@@ -1,47 +1,322 @@
-from anomalib.data import Visa
-from anomalib.deploy import ExportType
-from anomalib.engine import Engine
-from anomalib.models import Patchcore
+"""Anomaly detection training pipeline.
 
-N = 50
+Usage
+-----
+    python main.py --category candle --max_epochs 50
+    python main.py --category capsules --batch_size 16 --image_size 256
+    python main.py --help
+"""
 
-datamodule = Visa(
-    root="./datasets/visa",
-    category="candle",
-    train_batch_size=16,
-    eval_batch_size=16,
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
+import mlflow
+import pytorch_lightning as pl
+import torch
+from codecarbon import EmissionsTracker
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import MLFlowLogger
+from pytorch_lightning.strategies import SingleDeviceStrategy
+
+from lib.accelerators import XPUAccelerator
+from lib.data import (
+    VisADataModule,
+    get_dinomaly_mask_transforms,
+    get_dinomaly_transforms,
 )
-
-_original_setup = datamodule.setup
-
-def _setup_with_limit(stage=None):
-    _original_setup(stage)
-    for attr in ("train_data", "val_data", "test_data"):
-        split = getattr(datamodule, attr, None)
-        if split is not None:
-            n = min(N, len(split))
-            split.subsample(list(range(n)), inplace=True)
-
-
-datamodule.setup = _setup_with_limit
-
-model = Patchcore(
-    num_neighbours=6,
+from lib.lightning import (
+    AutoencoderModule,
+    DinomalyModule,
+    EfficientAdModule,
+    PatchCoreModule,
 )
+from lib.lightning.callbacks import InferenceSpeedMonitor, MemoryMonitor
 
-engine = Engine(
-    max_epochs=10,
-)
 
-engine.fit(datamodule=datamodule, model=model)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="VisA Anomaly Detection")
 
-test_results = engine.test(datamodule=datamodule, model=model)
+    # Data
+    parser.add_argument("--dataset_root", type=str, default="datasets/visa")
+    parser.add_argument("--category", type=str, default="candle")
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=4)
 
-engine.export(
-    model=model,
-    export_type=ExportType.ONNX,
-)
-engine.export(
-    model=model,
-    export_type=ExportType.OPENVINO,
-)
+    # Model
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        choices=["autoencoder", "patchcore", "dinomaly", "efficientad"],
+        help="Model architecture to use.",
+    )
+    parser.add_argument("--base_channels", type=int, default=32)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--latent_dim", type=int, default=256)
+
+    # PatchCore-specific
+    parser.add_argument(
+        "--coreset_sampling_ratio",
+        type=float,
+        default=0.01,
+        help="Fraction of patches kept in the coreset (PatchCore).",
+    )
+    parser.add_argument(
+        "--num_neighbors",
+        type=int,
+        default=9,
+        help="Neighbours for image-score re-weighting (PatchCore).",
+    )
+
+    # Dinomaly-specific
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        default="dinov2reg_vit_base_14",
+        choices=[
+            "dinov2reg_vit_small_14",
+            "dinov2reg_vit_base_14",
+            "dinov2reg_vit_large_14",
+        ],
+        help="DINOv2 backbone for Dinomaly.",
+    )
+    parser.add_argument(
+        "--total_iters",
+        type=int,
+        default=10000,
+        help="Total training iterations (Dinomaly).",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.2,
+        help="Bottleneck dropout rate (Dinomaly).",
+    )
+
+    # EfficientAd-specific
+    parser.add_argument(
+        "--model_size",
+        type=str,
+        default="small",
+        choices=["small", "medium"],
+        help="PDN variant for EfficientAd (small or medium).",
+    )
+    parser.add_argument(
+        "--train_steps",
+        type=int,
+        default=70000,
+        help="Total training iterations for EfficientAd student + AE.",
+    )
+    parser.add_argument(
+        "--teacher_pretrain_steps",
+        type=int,
+        default=10000,
+        help="KD pretraining iterations for the EfficientAd teacher PDN.",
+    )
+    parser.add_argument(
+        "--teacher_weights",
+        type=str,
+        default=None,
+        help="Path to pre-trained teacher PDN weights (skips KD pretraining).",
+    )
+
+    # Training
+    parser.add_argument("--max_epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=int, default=1)
+
+    # MLflow
+    parser.add_argument("--experiment_name", type=str, default="visa-anomaly-detection")
+    parser.add_argument("--tracking_uri", type=str, default="sqlite:///mlflow.db")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    # ── MLflow setup ─────────────────────────────────────────────────
+    mlflow.set_tracking_uri(args.tracking_uri)
+    mlflow_logger = MLFlowLogger(
+        experiment_name=args.experiment_name,
+        tracking_uri=args.tracking_uri,
+        run_name=f"{args.model}-{args.category}",
+        log_model=True,
+    )
+
+    # ── CodeCarbon tracker ───────────────────────────────────────────
+    Path("logs").mkdir(exist_ok=True)
+    emissions_tracker = EmissionsTracker(
+        project_name=f"{args.experiment_name}/{args.model}/{args.category}",
+        output_dir="logs",
+        log_level="warning",
+    )
+
+    # ── DataModule ───────────────────────────────────────────────────
+    extra_dm_kwargs: dict = {}
+    if args.model == "dinomaly":
+        dinomaly_transform = get_dinomaly_transforms()
+        dinomaly_mask_transform = get_dinomaly_mask_transforms()
+        extra_dm_kwargs.update(
+            train_transform=dinomaly_transform,
+            eval_transform=dinomaly_transform,
+            mask_transform=dinomaly_mask_transform,
+        )
+        args.batch_size = min(args.batch_size, 16)  # paper default
+
+    datamodule = VisADataModule(
+        dataset_root=args.dataset_root,
+        category=args.category,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        **extra_dm_kwargs,
+    )
+
+    # ── Model ────────────────────────────────────────────────────────
+    if args.model == "patchcore":
+        model = PatchCoreModule(
+            coreset_sampling_ratio=args.coreset_sampling_ratio,
+            num_neighbors=args.num_neighbors,
+            image_size=args.image_size,
+        )
+        # PatchCore only needs a single epoch for memory-bank construction.
+        args.max_epochs = 1
+    elif args.model == "dinomaly":
+        # Dinomaly uses 448→392 centre-crop (392/14 = 28 patches).
+        args.image_size = 392
+
+        model = DinomalyModule(
+            backbone=args.backbone,
+            dropout=args.dropout,
+            total_iters=args.total_iters,
+        )
+
+        # Compute max_epochs from total_iters when not explicitly set.
+        datamodule.image_size = args.image_size
+        datamodule.batch_size = args.batch_size
+        datamodule.setup("fit")
+        steps_per_epoch = len(datamodule.train_dataloader())
+        if args.max_epochs is None:
+            args.max_epochs = int(math.ceil(args.total_iters / steps_per_epoch))
+    elif args.model == "efficientad":
+        # EfficientAd uses batch_size=1 per the paper.
+        args.batch_size = 1
+        datamodule.batch_size = args.batch_size
+
+        model = EfficientAdModule(
+            model_size=args.model_size,
+            train_steps=args.train_steps,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            image_size=args.image_size,
+            teacher_pretrain_steps=args.teacher_pretrain_steps,
+            teacher_weights=args.teacher_weights,
+        )
+
+        # Compute max_epochs from train_steps.
+        datamodule.setup("fit")
+        steps_per_epoch = len(datamodule.train_dataloader())
+        if args.max_epochs is None:
+            args.max_epochs = int(math.ceil(args.train_steps / steps_per_epoch))
+
+        # Pass training data loader reference for teacher pretraining.
+        model.set_train_dataloader(datamodule.train_dataloader())
+    elif args.model == "autoencoder":
+        model = AutoencoderModule(
+            in_channels=3,
+            base_channels=args.base_channels,
+            depth=args.depth,
+            latent_dim=args.latent_dim,
+            image_size=args.image_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        msg = f"Unknown model: {args.model!r}"
+        raise ValueError(msg)
+
+    # ── Callbacks ────────────────────────────────────────────────────
+    checkpoint_dir = Path("checkpoints") / args.category
+    callbacks = [InferenceSpeedMonitor(), MemoryMonitor()]
+    if args.model == "autoencoder":
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=str(checkpoint_dir),
+                filename="best-{epoch}-{val/loss:.4f}",
+                monitor="val/loss",
+                mode="min",
+                save_top_k=1,
+            )
+        )
+        callbacks.append(
+            EarlyStopping(
+                monitor="val/loss",
+                patience=args.patience,
+                mode="min",
+            )
+        )
+
+    # ── Trainer ──────────────────────────────────────────────────────
+    if args.max_epochs is None:
+        args.max_epochs = 100
+
+    # Lightning doesn't ship a built-in XPU accelerator in all versions,
+    # so we resolve it manually when requested (or detected by "auto").
+    use_xpu = args.accelerator == "xpu" or (
+        args.accelerator == "auto"
+        and hasattr(torch, "xpu")
+        and torch.xpu.is_available()
+    )
+
+    if use_xpu:
+        trainer = pl.Trainer(
+            max_epochs=args.max_epochs,
+            accelerator=XPUAccelerator(),
+            strategy=SingleDeviceStrategy(device=torch.device("xpu", 0)),
+            devices=1,
+            logger=mlflow_logger,
+            callbacks=callbacks,
+            log_every_n_steps=10,
+        )
+    else:
+        trainer = pl.Trainer(
+            max_epochs=args.max_epochs,
+            accelerator=args.accelerator,
+            devices=args.devices,
+            logger=mlflow_logger,
+            callbacks=callbacks,
+            log_every_n_steps=10,
+        )
+
+    # ── Log CLI args to MLflow (as tags, to avoid clashing with model hparams) ──
+    for k, v in vars(args).items():
+        mlflow_logger.experiment.set_tag(mlflow_logger.run_id, f"cli/{k}", str(v))
+
+    # ── Train & Test ─────────────────────────────────────────────────
+    emissions_tracker.start()
+    try:
+        datamodule.setup("fit")
+        trainer.fit(model, datamodule.train_dataloader(), datamodule.val_dataloader())
+
+        datamodule.setup("test")
+        trainer.test(model, datamodule.test_dataloader())
+    finally:
+        emissions = emissions_tracker.stop()
+        if emissions is not None:
+            mlflow_logger.log_metrics({"carbon/emissions_kg": emissions})
+
+    print(f"\n✓ Training complete for category '{args.category}'.")
+    print(f"  Checkpoints saved to: {checkpoint_dir.resolve()}")
+    print(f"  MLflow UI: mlflow ui --backend-store-uri {args.tracking_uri}")
+
+
+if __name__ == "__main__":
+    main()

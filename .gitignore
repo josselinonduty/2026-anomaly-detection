@@ -11,6 +11,12 @@ wheels/
 # Virtual environments
 .venv
 
+# IDEs
+.github/
+.idea/
+.claude/
+.vscode/
+
 # Data
 data/
 datasets/
@@ -18,3 +24,10 @@ logs/
 results/
 pre_trained/
 results/
+
+# Experiment tracking
+mlruns/
+mlflow.db
+mlflow.db-*
+logs/
+checkpoints/

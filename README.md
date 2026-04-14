@@ -1,1 +1,0 @@
-# Industrial Anomaly Detection & Spot-the-Difference
