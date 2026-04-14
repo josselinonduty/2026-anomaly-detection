@@ -30,6 +30,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+base = [
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+]
 xpu = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
@@ -43,6 +47,14 @@ dev = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "base" },
+        { extra = "xpu" },
+    ],
+]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-xpu", extra = "xpu" }]
