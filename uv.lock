@@ -1128,6 +1128,12 @@ dependencies = [
     { name = "torch" },
     { name = "torchvision" },
     { name = "transformers" },
+]
+
+[package.optional-dependencies]
+xpu = [
+    { name = "torch" },
+    { name = "torchvision" },
     { name = "triton-xpu" },
 ]
 
@@ -1157,11 +1163,14 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "torch", specifier = ">=2.10.0", index = "https://download.pytorch.org/whl/xpu" },
-    { name = "torchvision", specifier = ">=0.25.0", index = "https://download.pytorch.org/whl/xpu" },
+    { name = "torch", specifier = ">=2.10.0" },
+    { name = "torch", marker = "extra == 'xpu'", specifier = ">=2.10.0", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "iad", extra = "xpu" } },
+    { name = "torchvision", specifier = ">=0.25.0" },
+    { name = "torchvision", marker = "extra == 'xpu'", specifier = ">=0.25.0", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "iad", extra = "xpu" } },
     { name = "transformers", specifier = ">=5.5.3" },
-    { name = "triton-xpu", specifier = ">=3.6.0", index = "https://download.pytorch.org/whl/xpu" },
+    { name = "triton-xpu", marker = "extra == 'xpu'", specifier = ">=3.6.0", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "iad", extra = "xpu" } },
 ]
+provides-extras = ["xpu"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ipykernel", specifier = ">=7.2.0" }]

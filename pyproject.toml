@@ -26,6 +26,12 @@ dependencies = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
     "transformers>=5.5.3",
+]
+
+[project.optional-dependencies]
+xpu = [
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
     "triton-xpu>=3.6.0",
 ]
 
@@ -38,12 +44,9 @@ dev = [
 allow-direct-references = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-xpu" }
-torchvision = { index = "pytorch-xpu" }
-# torchaudio = { index = "pytorch-xpu" }
-# pytorch-triton-xpu = { index = "pytorch-xpu" }
-triton-xpu = { index = "pytorch-xpu" }
-# anomalib = { path = "../anomalib" }
+torch = [{ index = "pytorch-xpu", extra = "xpu" }]
+torchvision = [{ index = "pytorch-xpu", extra = "xpu" }]
+triton-xpu = [{ index = "pytorch-xpu", extra = "xpu" }]
 
 [[tool.uv.index]]
 name = "pytorch-xpu"
