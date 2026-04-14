@@ -8,6 +8,7 @@ dependencies = [
     "anomalib>=2.3.0",
     "codecarbon>=3.2.6",
     "datasets>=4.8.4",
+    "gradio>=6.12.0",
     "huggingface-hub>=1.5.0",
     "kornia>=0.8.2",
     "matplotlib>=3.10.8",
@@ -23,14 +24,12 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
     "transformers>=5.5.3",
 ]
 
 [project.optional-dependencies]
-base = [
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
-]
 xpu = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
@@ -44,14 +43,6 @@ dev = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
-
-[tool.uv]
-conflicts = [
-    [
-        { extra = "base" },
-        { extra = "xpu" },
-    ],
-]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-xpu", extra = "xpu" }]
