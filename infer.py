@@ -26,11 +26,14 @@ from lib.data import (
     get_dinomaly_mask_transforms,
     get_dinomaly_transforms,
 )
+from lib.data.transforms import get_eval_transforms, get_mask_transforms
 from lib.lightning import (
+    AnomalyDINOModule,
     AutoencoderModule,
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
+    WinCLIPModule,
 )
 from lib.utils.checkpoint import latest_checkpoint_dir
 
@@ -43,6 +46,8 @@ _LOADER_MAP = {
     "patchcore": PatchCoreModule,
     "dinomaly": DinomalyModule,
     "efficientad": EfficientAdModule,
+    "anomalydino": AnomalyDINOModule,
+    "winclip": WinCLIPModule,
 }
 
 
@@ -61,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         required=True,
-        choices=["autoencoder", "patchcore", "dinomaly", "efficientad"],
+        choices=["autoencoder", "patchcore", "dinomaly", "efficientad", "anomalydino", "winclip"],
         help="Model architecture to use.",
     )
 
@@ -141,11 +146,31 @@ def _predict_efficientad(
     return map_combined[:, 0]
 
 
+@torch.no_grad()
+def _predict_anomalydino(
+    model: AnomalyDINOModule, images: torch.Tensor
+) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model(images)
+    return anomaly_maps
+
+
+@torch.no_grad()
+def _predict_winclip(
+    model: WinCLIPModule, images: torch.Tensor
+) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model(images)
+    return anomaly_maps
+
+
 _PREDICT_FN = {
     "autoencoder": _predict_autoencoder,
     "patchcore": _predict_patchcore,
     "dinomaly": _predict_dinomaly,
     "efficientad": _predict_efficientad,
+    "anomalydino": _predict_anomalydino,
+    "winclip": _predict_winclip,
 }
 
 
@@ -240,6 +265,20 @@ def main() -> None:
             mask_transform=get_dinomaly_mask_transforms(),
         )
         image_size = 392
+    elif args.model == "anomalydino":
+        image_size = 448
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
+    elif args.model == "winclip":
+        image_size = 240
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
 
     datamodule = VisADataModule(
         dataset_root=args.dataset_root,
