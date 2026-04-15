@@ -152,7 +152,7 @@ def _predict_anomalydino(
 ) -> torch.Tensor:
     """Return (B, H, W) anomaly maps."""
     _, anomaly_maps = model(images)
-    return anomaly_maps
+    return anomaly_maps[:, 0]
 
 
 @torch.no_grad()
