@@ -29,6 +29,7 @@ from lib.data import (
 )
 from lib.lightning import (
     AnomalyDINOModule,
+    AnomalyTIPSv2Module,
     AutoencoderModule,
     DinomalyModule,
     EfficientAdModule,
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
             "dinomaly",
             "efficientad",
             "anomalydino",
+            "anomalytipsv2",
             "winclip",
         ],
         help="Model architecture to use.",
@@ -186,6 +188,20 @@ def parse_args() -> argparse.Namespace:
         help="Number of normal reference shots for WinCLIP+ (0 = zero-shot).",
     )
 
+    # AnomalyTIPSv2-specific
+    parser.add_argument(
+        "--tips_model",
+        type=str,
+        default="google/tipsv2-b14",
+        choices=[
+            "google/tipsv2-b14",
+            "google/tipsv2-l14",
+            "google/tipsv2-so400m14",
+            "google/tipsv2-g14",
+        ],
+        help="TIPSv2 backbone for AnomalyTIPSv2.",
+    )
+
     # Training
     parser.add_argument("--max_epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -249,6 +265,7 @@ def main() -> None:
         | EfficientAdModule
         | AutoencoderModule
         | AnomalyDINOModule
+        | AnomalyTIPSv2Module
         | WinCLIPModule
     )
     if args.model == "patchcore":
@@ -370,6 +387,36 @@ def main() -> None:
             k_shot=args.k_shot,
         )
         # WinCLIP only needs a single epoch (for gallery construction).
+        args.max_epochs = 1
+    elif args.model == "anomalytipsv2":
+        # AnomalyTIPSv2 uses TIPSv2 preprocessing (resize by smaller edge, [0,1]).
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        tipsv2_transform = get_eval_transforms(args.smaller_edge_size)
+        tipsv2_mask_transform = get_mask_transforms(args.smaller_edge_size)
+        extra_dm_kwargs.update(
+            train_transform=tipsv2_transform,
+            eval_transform=tipsv2_transform,
+            mask_transform=tipsv2_mask_transform,
+        )
+        datamodule = VisADataModule(
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=args.smaller_edge_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = args.smaller_edge_size
+
+        model = AnomalyTIPSv2Module(
+            model_name=args.tips_model,
+            smaller_edge_size=args.smaller_edge_size,
+            masking=not args.no_masking,
+            rotation=not args.no_rotation,
+            image_size=args.image_size,
+        )
+        # AnomalyTIPSv2 only needs a single epoch for memory-bank construction.
         args.max_epochs = 1
     else:
         msg = f"Unknown model: {args.model!r}"

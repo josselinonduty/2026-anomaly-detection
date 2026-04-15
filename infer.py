@@ -29,6 +29,7 @@ from lib.data import (
 from lib.data.transforms import get_eval_transforms, get_mask_transforms
 from lib.lightning import (
     AnomalyDINOModule,
+    AnomalyTIPSv2Module,
     AutoencoderModule,
     DinomalyModule,
     EfficientAdModule,
@@ -47,6 +48,7 @@ _LOADER_MAP = {
     "dinomaly": DinomalyModule,
     "efficientad": EfficientAdModule,
     "anomalydino": AnomalyDINOModule,
+    "anomalytipsv2": AnomalyTIPSv2Module,
     "winclip": WinCLIPModule,
 }
 
@@ -66,7 +68,15 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         required=True,
-        choices=["autoencoder", "patchcore", "dinomaly", "efficientad", "anomalydino", "winclip"],
+        choices=[
+            "autoencoder",
+            "patchcore",
+            "dinomaly",
+            "efficientad",
+            "anomalydino",
+            "anomalytipsv2",
+            "winclip",
+        ],
         help="Model architecture to use.",
     )
 
@@ -156,6 +166,15 @@ def _predict_anomalydino(
 
 
 @torch.no_grad()
+def _predict_anomalytipsv2(
+    model: AnomalyTIPSv2Module, images: torch.Tensor
+) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model(images)
+    return anomaly_maps[:, 0]
+
+
+@torch.no_grad()
 def _predict_winclip(
     model: WinCLIPModule, images: torch.Tensor
 ) -> torch.Tensor:
@@ -170,6 +189,7 @@ _PREDICT_FN = {
     "dinomaly": _predict_dinomaly,
     "efficientad": _predict_efficientad,
     "anomalydino": _predict_anomalydino,
+    "anomalytipsv2": _predict_anomalytipsv2,
     "winclip": _predict_winclip,
 }
 
@@ -266,6 +286,13 @@ def main() -> None:
         )
         image_size = 392
     elif args.model == "anomalydino":
+        image_size = 448
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
+    elif args.model == "anomalytipsv2":
         image_size = 448
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),
