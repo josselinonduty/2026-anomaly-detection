@@ -245,3 +245,17 @@ class AnomalyDINOModule(LightningModule):
             "fitted": self.model._fitted,
         }
         torch.save(state, ckpt_dir / "model.ckpt")
+
+    @classmethod
+    def load_checkpoint(
+        cls, ckpt_dir: str | Path, map_location: str = "cpu"
+    ) -> "AnomalyDINOModule":
+        """Restore an AnomalyDINO module from *ckpt_dir*."""
+        ckpt_dir = Path(ckpt_dir)
+        state = torch.load(ckpt_dir / "model.ckpt", map_location=map_location)
+        module = cls(**state["hparams"])
+        if state["fitted"]:
+            bank_path = ckpt_dir / "memory_bank.npy"
+            module.model._memory_bank = np.load(bank_path)
+            module.model._fitted = True
+        return module
