@@ -73,7 +73,8 @@ class AnomalyDINOModule(LightningModule):
         self._image_size = image_size
 
         # Feature accumulator for the single training epoch.
-        self._train_images: list[np.ndarray] = []
+        self._train_features: list[np.ndarray] = []
+        self._train_image_count: int = 0
 
         # Metric accumulators.
         self._val_labels: list[torch.Tensor] = []
@@ -104,9 +105,8 @@ class AnomalyDINOModule(LightningModule):
         if self.model._fitted:
             return
 
-        # Collect raw image tensors — we feed them through the model's own
-        # prepare_image pipeline in on_train_epoch_end to honour DINOv2's
-        # exact preprocessing (resize by smaller edge, crop to patch multiple).
+        # Extract features incrementally per batch instead of accumulating
+        # all raw images in RAM.
         images = batch["image"]  # (B, C, H, W) normalised tensors
 
         # Denormalise back to [0, 255] uint8 for the model's prepare_image.
@@ -117,21 +117,41 @@ class AnomalyDINOModule(LightningModule):
 
         for i in range(images_denorm.shape[0]):
             img_np = images_denorm[i].permute(1, 2, 0).cpu().numpy()  # HWC RGB
-            self._train_images.append(img_np)
+
+            # Augment with rotations if enabled.
+            variants = (
+                self.model.augment_reference(img_np)
+                if self.model.rotation
+                else [img_np]
+            )
+
+            for variant in variants:
+                img_tensor, grid_size = self.model.prepare_image(variant)
+                features = self.model.extract_features(img_tensor)
+                self._train_features.append(features)
+
+            self._train_image_count += 1
 
     def on_train_epoch_end(self) -> None:
-        if self.model._fitted or not self._train_images:
+        if self.model._fitted or not self._train_features:
             return
 
-        self.model.fit(self._train_images)
-        n_patches = self.model._memory_bank.shape[0] if self.model._memory_bank is not None else 0
+        all_features = np.concatenate(self._train_features, axis=0).astype(np.float32)
+        # L2-normalise for cosine distance.
+        norms = np.linalg.norm(all_features, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        self.model._memory_bank = all_features / norms
+        self.model._fitted = True
 
-        self._train_images.clear()
+        n_patches = self.model._memory_bank.shape[0]
+        n_images = self._train_image_count
+
+        self._train_features.clear()
+        self._train_image_count = 0
 
         print(
             f"AnomalyDINO: memory bank built — {n_patches} patches "
-            f"from {len(self._train_images) if self._train_images else 'all'} "
-            f"reference images "
+            f"from {n_images} reference images "
             f"(masking={self.model.masking}, rotation={self.model.rotation})",
         )
 
@@ -214,9 +234,14 @@ class AnomalyDINOModule(LightningModule):
         """Persist the memory bank and hparams to *ckpt_dir*."""
         ckpt_dir = Path(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save the (potentially large) memory bank as a separate .npy file
+        # to avoid pickle protocol limits with torch.save.
+        if self.model._memory_bank is not None:
+            np.save(ckpt_dir / "memory_bank.npy", self.model._memory_bank)
+
         state = {
             "hparams": dict(self.hparams),
-            "memory_bank": self.model._memory_bank,
             "fitted": self.model._fitted,
         }
         torch.save(state, ckpt_dir / "model.ckpt")

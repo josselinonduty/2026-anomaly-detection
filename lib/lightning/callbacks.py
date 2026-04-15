@@ -164,6 +164,15 @@ class MemoryMonitor(Callback):
             allocated = torch.xpu.memory_allocated(device) / (1024 * 1024)
             reserved = torch.xpu.memory_reserved(device) / (1024 * 1024)
             return allocated, reserved
+        if device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            allocated = torch.mps.current_allocated_memory() / (1024 * 1024)
+            # MPS has driver_allocated_memory (≈ reserved) in newer PyTorch.
+            reserved = (
+                torch.mps.driver_allocated_memory() / (1024 * 1024)
+                if hasattr(torch.mps, "driver_allocated_memory")
+                else 0.0
+            )
+            return allocated, reserved
         return 0.0, 0.0
 
     def _log_memory(self, stage: str, pl_module: LightningModule) -> None:
