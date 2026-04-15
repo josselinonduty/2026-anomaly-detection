@@ -389,19 +389,20 @@ class AnomalyDINO(nn.Module):
     @staticmethod
     def _chunked_nn_torch(
         queries: torch.Tensor,
-        bank: torch.Tensor,
+        bank_np: np.ndarray,
         chunk_size: int = 65536,
     ) -> torch.Tensor:
         """Chunked cosine NN on device (torch).
 
-        Splits the memory bank into chunks to avoid exceeding device
-        memory or integer-index limits (e.g. MPS INT_MAX).
+        The memory bank is kept as a **numpy array on CPU** and only small
+        chunks are transferred to the compute device.  This avoids creating
+        a single device tensor whose total number of elements may exceed
+        backend limits (e.g. MPS INT_MAX ≈ 2.1 G elements).
         """
-        max_sim = torch.full(
-            (queries.shape[0],), -float("inf"), device=queries.device
-        )
-        for start in range(0, bank.shape[0], chunk_size):
-            chunk = bank[start : start + chunk_size]
+        device = queries.device
+        max_sim = torch.full((queries.shape[0],), -float("inf"), device=device)
+        for start in range(0, bank_np.shape[0], chunk_size):
+            chunk = torch.from_numpy(bank_np[start : start + chunk_size]).to(device)
             sims = queries @ chunk.T
             chunk_max, _ = sims.max(dim=1)
             max_sim = torch.maximum(max_sim, chunk_max)
@@ -460,8 +461,6 @@ class AnomalyDINO(nn.Module):
         scores_list: list[float] = []
         maps_list: list[torch.Tensor] = []
 
-        memory_bank_t = torch.from_numpy(self._memory_bank).to(device)
-
         for i in range(B):
             img_tensor = images[i].unsqueeze(0)
             tokens = self.backbone.get_intermediate_layers(img_tensor)[0].squeeze()
@@ -480,7 +479,7 @@ class AnomalyDINO(nn.Module):
             masked_features = features_t[torch.from_numpy(mask).to(device)]
 
             # Cosine NN distances (chunked to avoid exceeding device limits).
-            max_sim = self._chunked_nn_torch(masked_features, memory_bank_t)
+            max_sim = self._chunked_nn_torch(masked_features, self._memory_bank)
             dists = 1.0 - max_sim
 
             # Place back.
