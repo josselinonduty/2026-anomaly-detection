@@ -342,9 +342,7 @@ class AnomalyDINO(nn.Module):
         # With L2-normalised vectors: ||a - b||^2 / 2 = 1 - a·b = cosine_dist
         # FAISS L2 on normalised vectors gives ||a-b||^2, so divide by 2.
         masked_features = features_normed[mask]
-        # Brute-force NN via matrix multiply (efficient for moderate bank size).
-        similarities = masked_features @ self._memory_bank.T  # (M, N_bank)
-        max_sim = similarities.max(axis=1)  # closest neighbour similarity
+        max_sim = self._chunked_nn_numpy(masked_features, self._memory_bank)
         distances = 1.0 - max_sim  # cosine distance
 
         # Place distances back into the full grid.
@@ -364,6 +362,50 @@ class AnomalyDINO(nn.Module):
         anomaly_map = gaussian_filter(anomaly_map, sigma=self.gaussian_sigma)
 
         return float(score), anomaly_map
+
+    # ------------------------------------------------------------------
+    # Chunked nearest-neighbour search
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _chunked_nn_numpy(
+        queries: np.ndarray,
+        bank: np.ndarray,
+        chunk_size: int = 65536,
+    ) -> np.ndarray:
+        """Chunked cosine NN on CPU (numpy).
+
+        Splits the memory bank into chunks to keep intermediate matrices
+        within reasonable size limits.
+        """
+        max_sim = np.full(queries.shape[0], -np.inf, dtype=np.float32)
+        for start in range(0, bank.shape[0], chunk_size):
+            chunk = bank[start : start + chunk_size]
+            sims = queries @ chunk.T  # (M, chunk)
+            chunk_max = sims.max(axis=1)
+            np.maximum(max_sim, chunk_max, out=max_sim)
+        return max_sim
+
+    @staticmethod
+    def _chunked_nn_torch(
+        queries: torch.Tensor,
+        bank: torch.Tensor,
+        chunk_size: int = 65536,
+    ) -> torch.Tensor:
+        """Chunked cosine NN on device (torch).
+
+        Splits the memory bank into chunks to avoid exceeding device
+        memory or integer-index limits (e.g. MPS INT_MAX).
+        """
+        max_sim = torch.full(
+            (queries.shape[0],), -float("inf"), device=queries.device
+        )
+        for start in range(0, bank.shape[0], chunk_size):
+            chunk = bank[start : start + chunk_size]
+            sims = queries @ chunk.T
+            chunk_max, _ = sims.max(dim=1)
+            max_sim = torch.maximum(max_sim, chunk_max)
+        return max_sim
 
     def _mean_top_percent(self, distances: np.ndarray) -> float:
         """Compute the mean of the top ``self.top_percent`` distances.
@@ -437,9 +479,8 @@ class AnomalyDINO(nn.Module):
 
             masked_features = features_t[torch.from_numpy(mask).to(device)]
 
-            # Cosine NN distances.
-            sims = masked_features @ memory_bank_t.T
-            max_sim, _ = sims.max(dim=1)
+            # Cosine NN distances (chunked to avoid exceeding device limits).
+            max_sim = self._chunked_nn_torch(masked_features, memory_bank_t)
             dists = 1.0 - max_sim
 
             # Place back.
