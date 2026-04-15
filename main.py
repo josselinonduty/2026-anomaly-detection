@@ -28,10 +28,12 @@ from lib.data import (
     get_dinomaly_transforms,
 )
 from lib.lightning import (
+    AnomalyDINOModule,
     AutoencoderModule,
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
+    WinCLIPModule,
 )
 from lib.lightning.callbacks import InferenceSpeedMonitor, MemoryMonitor
 from lib.utils.checkpoint import make_checkpoint_dir, save_metadata
@@ -52,7 +54,14 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         required=True,
-        choices=["autoencoder", "patchcore", "dinomaly", "efficientad"],
+        choices=[
+            "autoencoder",
+            "patchcore",
+            "dinomaly",
+            "efficientad",
+            "anomalydino",
+            "winclip",
+        ],
         help="Model architecture to use.",
     )
     parser.add_argument("--base_channels", type=int, default=32)
@@ -106,6 +115,38 @@ def parse_args() -> argparse.Namespace:
         choices=["small", "medium"],
         help="PDN variant for EfficientAd (small or medium).",
     )
+
+    # AnomalyDINO-specific
+    parser.add_argument(
+        "--dino_model",
+        type=str,
+        default="dinov2_vits14",
+        choices=[
+            "dinov2_vits14",
+            "dinov2_vitb14",
+            "dinov2_vitl14",
+            "dinov2_vitg14",
+        ],
+        help="DINOv2 backbone for AnomalyDINO.",
+    )
+    parser.add_argument(
+        "--smaller_edge_size",
+        type=int,
+        default=448,
+        help="Resize shorter edge to this value (AnomalyDINO).",
+    )
+    parser.add_argument(
+        "--no_masking",
+        action="store_true",
+        default=False,
+        help="Disable PCA-based foreground masking (AnomalyDINO).",
+    )
+    parser.add_argument(
+        "--no_rotation",
+        action="store_true",
+        default=False,
+        help="Disable rotation augmentation of references (AnomalyDINO).",
+    )
     parser.add_argument(
         "--train_steps",
         type=int,
@@ -123,6 +164,26 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to pre-trained teacher PDN weights (skips KD pretraining).",
+    )
+
+    # WinCLIP-specific
+    parser.add_argument(
+        "--clip_backbone",
+        type=str,
+        default="ViT-B-16-plus-240",
+        help="OpenCLIP model name for WinCLIP.",
+    )
+    parser.add_argument(
+        "--clip_pretrained",
+        type=str,
+        default="laion400m_e32",
+        help="Pretrained dataset for WinCLIP.",
+    )
+    parser.add_argument(
+        "--k_shot",
+        type=int,
+        default=0,
+        help="Number of normal reference shots for WinCLIP+ (0 = zero-shot).",
     )
 
     # Training
@@ -182,7 +243,14 @@ def main() -> None:
     )
 
     # ── Model ────────────────────────────────────────────────────────
-    model: PatchCoreModule | DinomalyModule | EfficientAdModule | AutoencoderModule
+    model: (
+        PatchCoreModule
+        | DinomalyModule
+        | EfficientAdModule
+        | AutoencoderModule
+        | AnomalyDINOModule
+        | WinCLIPModule
+    )
     if args.model == "patchcore":
         model = PatchCoreModule(
             coreset_sampling_ratio=args.coreset_sampling_ratio,
@@ -241,6 +309,68 @@ def main() -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
+    elif args.model == "anomalydino":
+        # AnomalyDINO uses its own DINOv2 preprocessing (resize by smaller edge).
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        anomalydino_transform = get_eval_transforms(args.smaller_edge_size)
+        anomalydino_mask_transform = get_mask_transforms(args.smaller_edge_size)
+        extra_dm_kwargs.update(
+            train_transform=anomalydino_transform,
+            eval_transform=anomalydino_transform,
+            mask_transform=anomalydino_mask_transform,
+        )
+        datamodule = VisADataModule(
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=args.smaller_edge_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = args.smaller_edge_size
+
+        model = AnomalyDINOModule(
+            model_name=args.dino_model,
+            smaller_edge_size=args.smaller_edge_size,
+            masking=not args.no_masking,
+            rotation=not args.no_rotation,
+            image_size=args.image_size,
+        )
+        # AnomalyDINO only needs a single epoch for memory-bank construction.
+        args.max_epochs = 1
+    elif args.model == "winclip":
+        # WinCLIP uses CLIP preprocessing: resize + center-crop to 240×240
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        winclip_image_size = 240
+        winclip_transform = get_eval_transforms(winclip_image_size)
+        winclip_mask_transform = get_mask_transforms(winclip_image_size)
+        extra_dm_kwargs.update(
+            train_transform=winclip_transform,
+            eval_transform=winclip_transform,
+            mask_transform=winclip_mask_transform,
+        )
+        datamodule = VisADataModule(
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=winclip_image_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = winclip_image_size
+
+        model = WinCLIPModule(
+            category=args.category,
+            backbone=args.clip_backbone,
+            pretrained=args.clip_pretrained,
+            scales=(2, 3),
+            image_size=winclip_image_size,
+            k_shot=args.k_shot,
+        )
+        # WinCLIP only needs a single epoch (for gallery construction).
+        args.max_epochs = 1
     else:
         msg = f"Unknown model: {args.model!r}"
         raise ValueError(msg)
