@@ -31,6 +31,7 @@ from lib.lightning import (
     AnomalyDINOModule,
     AnomalyTIPSv2Module,
     AutoencoderModule,
+    DictASModule,
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
@@ -50,6 +51,7 @@ _LOADER_MAP = {
     "anomalydino": AnomalyDINOModule,
     "anomalytipsv2": AnomalyTIPSv2Module,
     "winclip": WinCLIPModule,
+    "dictas": DictASModule,
 }
 
 
@@ -76,6 +78,7 @@ def parse_args() -> argparse.Namespace:
             "anomalydino",
             "anomalytipsv2",
             "winclip",
+            "dictas",
         ],
         help="Model architecture to use.",
     )
@@ -183,6 +186,20 @@ def _predict_winclip(
     return anomaly_maps
 
 
+@torch.no_grad()
+def _predict_dictas(model: DictASModule, images: torch.Tensor) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps.  Requires a reference gallery."""
+    refs = model._reference_images
+    if refs is None:
+        raise RuntimeError(
+            "DictAS checkpoint is missing the normal reference gallery; "
+            "re-run main.py to build it."
+        )
+    refs = refs.to(images.device).unsqueeze(0).expand(images.shape[0], -1, -1, -1, -1)
+    _, anomaly_maps = model.model.predict(images, refs)
+    return anomaly_maps
+
+
 _PREDICT_FN = {
     "autoencoder": _predict_autoencoder,
     "patchcore": _predict_patchcore,
@@ -191,6 +208,7 @@ _PREDICT_FN = {
     "anomalydino": _predict_anomalydino,
     "anomalytipsv2": _predict_anomalytipsv2,
     "winclip": _predict_winclip,
+    "dictas": _predict_dictas,
 }
 
 
@@ -301,6 +319,13 @@ def main() -> None:
         )
     elif args.model == "winclip":
         image_size = 240
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
+    elif args.model == "dictas":
+        image_size = 336
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),
             eval_transform=get_eval_transforms(image_size),

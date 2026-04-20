@@ -2,8 +2,8 @@
 
 Usage
 -----
-    python main.py --category candle --max_epochs 50
-    python main.py --category capsules --batch_size 16 --image_size 256
+    python main.py --model dictas --category candle --k_shot 4
+    python main.py --model patchcore --category candle
     python main.py --help
 """
 
@@ -31,6 +31,7 @@ from lib.lightning import (
     AnomalyDINOModule,
     AnomalyTIPSv2Module,
     AutoencoderModule,
+    DictASModule,
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
@@ -63,6 +64,7 @@ def parse_args() -> argparse.Namespace:
             "anomalydino",
             "anomalytipsv2",
             "winclip",
+            "dictas",
         ],
         help="Model architecture to use.",
     )
@@ -185,7 +187,7 @@ def parse_args() -> argparse.Namespace:
         "--k_shot",
         type=int,
         default=0,
-        help="Number of normal reference shots for WinCLIP+ (0 = zero-shot).",
+        help="Normal reference shots (WinCLIP+: 0=zero-shot; DictAS: ≥1).",
     )
 
     # AnomalyTIPSv2-specific
@@ -200,6 +202,52 @@ def parse_args() -> argparse.Namespace:
             "google/tipsv2-g14",
         ],
         help="TIPSv2 backbone for AnomalyTIPSv2.",
+    )
+
+    # DictAS-specific
+    parser.add_argument(
+        "--dictas_backbone",
+        type=str,
+        default="ViT-L-14-336",
+        help="OpenCLIP backbone for DictAS (default ViT-L-14-336).",
+    )
+    parser.add_argument(
+        "--dictas_pretrained",
+        type=str,
+        default="openai",
+        help="Pretrained weights tag for DictAS (default openai).",
+    )
+    parser.add_argument(
+        "--dictas_layer_indices",
+        type=int,
+        nargs="+",
+        default=[6, 12, 18, 24],
+        help="1-based CLIP transformer blocks for feature extraction.",
+    )
+    parser.add_argument(
+        "--dictas_pool_kernel",
+        type=int,
+        default=3,
+        help="Avg-pool kernel on the patch grid (Appendix A.4).",
+    )
+    parser.add_argument(
+        "--dictas_lookup",
+        type=str,
+        default="sparse",
+        choices=["sparse", "dense", "max"],
+        help="Dictionary lookup strategy (Eq. 5).",
+    )
+    parser.add_argument(
+        "--dictas_lambda_cqc",
+        type=float,
+        default=0.1,
+        help="Weight λ1 for the Contrastive Query Constraint (Eq. 10).",
+    )
+    parser.add_argument(
+        "--dictas_lambda_tac",
+        type=float,
+        default=0.1,
+        help="Weight λ2 for the Text Alignment Constraint (Eq. 10).",
     )
 
     # Training
@@ -227,6 +275,7 @@ def main() -> None:
         tracking_uri=args.tracking_uri,
         run_name=f"{args.model}-{args.category}",
         log_model=True,
+        save_dir="mlruns",
     )
 
     # ── CodeCarbon tracker ───────────────────────────────────────────
@@ -267,6 +316,7 @@ def main() -> None:
         | AnomalyDINOModule
         | AnomalyTIPSv2Module
         | WinCLIPModule
+        | DictASModule
     )
     if args.model == "patchcore":
         model = PatchCoreModule(
@@ -274,19 +324,14 @@ def main() -> None:
             num_neighbors=args.num_neighbors,
             image_size=args.image_size,
         )
-        # PatchCore only needs a single epoch for memory-bank construction.
         args.max_epochs = 1
     elif args.model == "dinomaly":
-        # Dinomaly uses 448→392 centre-crop (392/14 = 28 patches).
         args.image_size = 392
-
         model = DinomalyModule(
             backbone=args.backbone,
             dropout=args.dropout,
             total_iters=args.total_iters,
         )
-
-        # Compute max_epochs from total_iters when not explicitly set.
         datamodule.image_size = args.image_size
         datamodule.batch_size = args.batch_size
         datamodule.setup("fit")
@@ -294,10 +339,8 @@ def main() -> None:
         if args.max_epochs is None:
             args.max_epochs = int(math.ceil(args.total_iters / steps_per_epoch))
     elif args.model == "efficientad":
-        # EfficientAd uses batch_size=1 per the paper.
         args.batch_size = 1
         datamodule.batch_size = args.batch_size
-
         model = EfficientAdModule(
             model_size=args.model_size,
             train_steps=args.train_steps,
@@ -307,14 +350,10 @@ def main() -> None:
             teacher_pretrain_steps=args.teacher_pretrain_steps,
             teacher_weights=args.teacher_weights,
         )
-
-        # Compute max_epochs from train_steps.
         datamodule.setup("fit")
         steps_per_epoch = len(datamodule.train_dataloader())
         if args.max_epochs is None:
             args.max_epochs = int(math.ceil(args.train_steps / steps_per_epoch))
-
-        # Pass training data loader reference for teacher pretraining.
         model.set_train_dataloader(datamodule.train_dataloader())
     elif args.model == "autoencoder":
         model = AutoencoderModule(
@@ -327,7 +366,6 @@ def main() -> None:
             weight_decay=args.weight_decay,
         )
     elif args.model == "anomalydino":
-        # AnomalyDINO uses its own DINOv2 preprocessing (resize by smaller edge).
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
         anomalydino_transform = get_eval_transforms(args.smaller_edge_size)
@@ -346,7 +384,6 @@ def main() -> None:
             **extra_dm_kwargs,
         )
         args.image_size = args.smaller_edge_size
-
         model = AnomalyDINOModule(
             model_name=args.dino_model,
             smaller_edge_size=args.smaller_edge_size,
@@ -354,10 +391,8 @@ def main() -> None:
             rotation=not args.no_rotation,
             image_size=args.image_size,
         )
-        # AnomalyDINO only needs a single epoch for memory-bank construction.
         args.max_epochs = 1
     elif args.model == "winclip":
-        # WinCLIP uses CLIP preprocessing: resize + center-crop to 240×240
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
         winclip_image_size = 240
@@ -377,7 +412,6 @@ def main() -> None:
             **extra_dm_kwargs,
         )
         args.image_size = winclip_image_size
-
         model = WinCLIPModule(
             category=args.category,
             backbone=args.clip_backbone,
@@ -386,10 +420,44 @@ def main() -> None:
             image_size=winclip_image_size,
             k_shot=args.k_shot,
         )
-        # WinCLIP only needs a single epoch (for gallery construction).
         args.max_epochs = 1
+    elif args.model == "dictas":
+        # DictAS: CLIP ViT-L/14-336 at 336×336 (Appendix A.4).
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        dictas_image_size = 336
+        dictas_transform = get_eval_transforms(dictas_image_size)
+        dictas_mask_transform = get_mask_transforms(dictas_image_size)
+        extra_dm_kwargs.update(
+            train_transform=dictas_transform,
+            eval_transform=dictas_transform,
+            mask_transform=dictas_mask_transform,
+        )
+        datamodule = VisADataModule(
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=dictas_image_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = dictas_image_size
+        model = DictASModule(
+            category=args.category,
+            backbone=args.dictas_backbone,
+            pretrained=args.dictas_pretrained,
+            image_size=dictas_image_size,
+            layer_indices=tuple(args.dictas_layer_indices),
+            pool_kernel=args.dictas_pool_kernel,
+            lookup=args.dictas_lookup,
+            k_shot=max(1, args.k_shot),
+            lambda_cqc=args.dictas_lambda_cqc,
+            lambda_tac=args.dictas_lambda_tac,
+            lr=args.lr if args.lr != 1e-3 else 1e-4,  # paper default 1e-4
+        )
+        if args.max_epochs is None:
+            args.max_epochs = 30  # Appendix A.4
     elif args.model == "anomalytipsv2":
-        # AnomalyTIPSv2 uses TIPSv2 preprocessing (resize by smaller edge, [0,1]).
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
         tipsv2_transform = get_eval_transforms(args.smaller_edge_size)
@@ -408,7 +476,6 @@ def main() -> None:
             **extra_dm_kwargs,
         )
         args.image_size = args.smaller_edge_size
-
         model = AnomalyTIPSv2Module(
             model_name=args.tips_model,
             smaller_edge_size=args.smaller_edge_size,
@@ -416,7 +483,6 @@ def main() -> None:
             rotation=not args.no_rotation,
             image_size=args.image_size,
         )
-        # AnomalyTIPSv2 only needs a single epoch for memory-bank construction.
         args.max_epochs = 1
     else:
         msg = f"Unknown model: {args.model!r}"
@@ -437,8 +503,6 @@ def main() -> None:
     if args.max_epochs is None:
         args.max_epochs = 100
 
-    # Lightning doesn't ship a built-in XPU accelerator in all versions,
-    # so we resolve it manually when requested (or detected by "auto").
     use_xpu = args.accelerator == "xpu" or (
         args.accelerator == "auto"
         and hasattr(torch, "xpu")
@@ -465,11 +529,9 @@ def main() -> None:
             log_every_n_steps=10,
         )
 
-    # ── Log CLI args to MLflow (as tags, to avoid clashing with model hparams) ──
     for k, v in vars(args).items():
         mlflow_logger.experiment.set_tag(mlflow_logger.run_id, f"cli/{k}", str(v))
 
-    # ── Train & Test ─────────────────────────────────────────────────
     emissions_tracker.start()
     try:
         datamodule.setup("fit")
@@ -482,7 +544,6 @@ def main() -> None:
         if emissions is not None:
             mlflow_logger.log_metrics({"carbon/emissions_kg": emissions})
 
-    # ── Save checkpoint ──────────────────────────────────────────────
     ckpt_dir = make_checkpoint_dir("checkpoints", args.model, args.category)
     model.save_checkpoint(ckpt_dir)
     save_metadata(
