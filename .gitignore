@@ -17,6 +17,7 @@ wheels/
 .claude/
 .vscode/
 .clinerules
+outputs/
 
 # Data
 /data/
