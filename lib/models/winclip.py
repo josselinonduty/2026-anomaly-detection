@@ -5,16 +5,16 @@ Reference
 Jeong, J., Zou, Y., Kim, T., Zhang, D., Ravichandran, A., & Dabeer, O. (2023).
 "WinCLIP: Zero-/Few-Shot Anomaly Classification and Segmentation." CVPR 2023.
 
-This implementation follows the paper exactly:
+This implementation follows the paper and the anomalib reference:
 - Backbone: ViT-B/16+ (ViT-B-16-plus-240) pre-trained via CLIP on LAION-400M.
-- Compositional prompt ensemble on state words × template prompts (Sec. 3.1).
-- Multi-scale window-based feature extraction at scales 2×2 and 3×3 (Sec. 3.2).
-- Per-window CLIP visual features aligned with text via CLS token pooling.
-- Zero-shot scoring: softmax over (normal, abnormal) text similarity, then
-  harmonic aggregation across windows and scales (Sec. 3.2).
-- Few-shot extension (WinCLIP+): builds a visual gallery from normal images
-  and scores via max cosine similarity, fused with textual scores via
-  harmonic mean (Sec. 3.3).
+- Compositional prompt ensemble on state words x template prompts (Sec. 3.1).
+- Multi-scale window-based feature extraction at scales 2x2 and 3x3 (Sec. 3.2).
+- Per-window: masked tokens are re-run through the ViT transformer to obtain
+  CLS-pooled CLIP embeddings for each sliding window location.
+- Zero-shot scoring: cosine similarity / tau softmax class scores, harmonic
+  aggregation within and across scales including full-image CLS (Sec. 3.2).
+- Few-shot (WinCLIP+): visual association score (Eq. 4), fused with zero-shot
+  scores via arithmetic mean (Sec. 3.3).
 """
 
 from __future__ import annotations
@@ -24,9 +24,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import open_clip
 
+# Temperature hyperparameter from the CLIP paper (tau = 0.07).
+TEMPERATURE = 0.07
 
-# ── Prompt definitions (Section 3.1, Table 1) ───────────────────────
-# State-level prompts: normal and abnormal descriptors composed with {object}
+# -- Prompt definitions (Section 3.1, Table 1) --
 STATE_NORMAL = [
     "{}",
     "flawless {}",
@@ -44,7 +45,6 @@ STATE_ABNORMAL = [
     "{} with damage",
 ]
 
-# Template-level prompts: photographic context wrappers
 TEMPLATES = [
     "a cropped photo of the {}",
     "a cropped photo of a {}",
@@ -71,20 +71,123 @@ TEMPLATES = [
 ]
 
 
+# -- Utility functions (matching anomalib) --
+
+
+def _class_scores(
+    embeddings: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    temperature: float = TEMPERATURE,
+    target_class: int | None = None,
+) -> torch.Tensor:
+    """Cosine-similarity softmax class scores (Eq. 1).
+
+    Parameters
+    ----------
+    embeddings : (N, D) or (B, N, D)
+    text_embeddings : (M, D) -- typically M=2 for [normal, abnormal].
+    temperature : float
+    target_class : optional int -- return only that class's probability.
+
+    Returns
+    -------
+    (..., M) or (...,) if target_class is set.
+    """
+    e = F.normalize(embeddings, dim=-1)
+    t = F.normalize(text_embeddings, dim=-1)
+    if e.ndim == 2:
+        sim = e @ t.T
+    else:
+        sim = torch.bmm(
+            e,
+            t.unsqueeze(0).expand(e.shape[0], -1, -1).transpose(-2, -1),
+        )
+    scores = (sim / temperature).softmax(dim=-1)
+    if target_class is not None:
+        return scores[..., target_class]
+    return scores
+
+
+def _harmonic_aggregation(
+    window_scores: torch.Tensor,
+    grid_size: int,
+    masks: torch.Tensor,
+) -> torch.Tensor:
+    """Aggregate per-window scores to a per-patch map via harmonic mean.
+
+    Parameters
+    ----------
+    window_scores : (B, n_windows)
+    grid_size : int -- spatial size G (grid is GxG).
+    masks : (s*s, n_windows) -- patch indices per window.
+
+    Returns
+    -------
+    (B, G, G) score map.
+    """
+    B = window_scores.shape[0]
+    device = window_scores.device
+    scores: list[torch.Tensor] = []
+    for idx in range(grid_size * grid_size):
+        patch_mask = torch.any(masks == idx, dim=0)  # (n_windows,) bool
+        n_covering = patch_mask.sum()
+        if n_covering == 0:
+            scores.append(torch.zeros(B, device=device))
+        else:
+            inv_sum = (1.0 / window_scores[:, patch_mask].clamp(min=1e-8)).sum(dim=1)
+            scores.append(n_covering.float() / inv_sum)
+    return (
+        torch.stack(scores, dim=1)
+        .reshape(B, grid_size, grid_size)
+        .nan_to_num(posinf=0.0)
+    )
+
+
+def _visual_association_score(
+    embeddings: torch.Tensor,
+    reference_embeddings: torch.Tensor,
+) -> torch.Tensor:
+    """Visual association score (Eq. 4): min cosine distance / 2.
+
+    Parameters
+    ----------
+    embeddings : (B, P, D)
+    reference_embeddings : (K, P, D)
+
+    Returns
+    -------
+    (B, P) -- higher = more anomalous.
+    """
+    ref_flat = reference_embeddings.reshape(-1, embeddings.shape[-1])
+    e = F.normalize(embeddings, dim=-1)
+    r = F.normalize(ref_flat, dim=-1)
+    sim = torch.bmm(
+        e,
+        r.unsqueeze(0).expand(e.shape[0], -1, -1).transpose(-2, -1),
+    )
+    return (1.0 - sim).min(dim=-1)[0] / 2.0
+
+
+# -- Main model --
+
+
 class WinCLIP(nn.Module):
     """WinCLIP(+) anomaly detection model.
 
     Parameters
     ----------
     backbone : str
-        OpenCLIP model name. Default ``"ViT-B-16-plus-240"`` as in the paper.
+        OpenCLIP model name. Default ``"ViT-B-16-plus-240"``.
     pretrained : str
         Pretrained dataset. Default ``"laion400m_e32"``.
     scales : tuple of int
-        Window sizes (in patches) for multi-scale extraction.
-        Default ``(2, 3)`` as in the paper.
+        Window sizes (in patches). Default ``(2, 3)``.
     image_size : int
-        Expected input resolution (after resize + crop). Default 240.
+        Expected input resolution. Default 240.
+    win_chunk_size : int
+        Max windows per transformer batch (memory vs speed). Default 32.
+    use_half : bool
+        Run in float16. Default True.
     """
 
     def __init__(
@@ -93,12 +196,15 @@ class WinCLIP(nn.Module):
         pretrained: str = "laion400m_e32",
         scales: tuple[int, ...] = (2, 3),
         image_size: int = 240,
+        win_chunk_size: int = 32,
+        use_half: bool = True,
     ) -> None:
         super().__init__()
         self.scales = scales
         self.image_size = image_size
+        self.win_chunk_size = win_chunk_size
+        self.use_half = use_half
 
-        # ── Load pre-trained CLIP model ──────────────────────────────
         model, _, _ = open_clip.create_model_and_transforms(
             backbone,
             pretrained=pretrained,
@@ -106,339 +212,304 @@ class WinCLIP(nn.Module):
         model.eval()
         self.clip = model
 
-        # Freeze all parameters — WinCLIP never trains.
         for param in self.clip.parameters():
             param.requires_grad = False
+        if use_half:
+            self.clip = self.clip.half()
+
+        # Enable output_tokens for encode_image
+        self.clip.visual.output_tokens = True
 
         self.tokenizer = open_clip.get_tokenizer(backbone)
 
-        # ── Extract ViT geometry from the visual encoder ─────────────
         vit = self.clip.visual
-        self.patch_size: int = vit.conv1.kernel_size[0]  # type: ignore[index]
+        self.patch_size: int = vit.conv1.kernel_size[0]
         self.grid_size: int = image_size // self.patch_size
-        self.embed_dim: int = vit.conv1.out_channels  # transformer width
+        self.embed_dim: int = vit.conv1.out_channels
 
-        # ── Pre-compute window masks ─────────────────────────────────
-        self._build_window_masks()
+        # Multi-scale masks: list of (s*s, n_windows) per scale
+        self._masks_per_scale = self._generate_masks()
 
-        # ── Text features (populated by ``build_text_features``) ─────
+        # Text features (2, D) -- populated by build_text_features
         self.register_buffer("text_features", torch.empty(0))
         self._text_ready = False
 
-        # ── Visual gallery (populated by WinCLIP+ ``build_visual_gallery``) ──
-        self.visual_gallery: list[torch.Tensor] | None = None
+        # Visual gallery for WinCLIP+
+        self._visual_embeddings: list[torch.Tensor] | None = None
+        self._patch_embeddings: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
-    # Window mask generation
+    # Mask generation
     # ------------------------------------------------------------------
 
-    def _build_window_masks(self) -> None:
-        """Pre-compute index masks for each window at each scale.
-
-        For each scale s, windows of size s×s are slid over the grid_size×grid_size
-        patch grid. Each mask stores the flattened patch indices belonging to
-        that window.
-        """
+    def _generate_masks(self) -> list[torch.Tensor]:
+        """Sliding-window masks per scale, shape ``(s*s, n_windows)``."""
         G = self.grid_size
-        index_grid = torch.arange(G * G, dtype=torch.long).reshape(G, G)
-
-        masks: list[torch.Tensor] = []
-        scale_begin: list[int] = []
-
+        grid = torch.arange(G * G).reshape(1, G, G).float()
+        masks = []
         for s in self.scales:
-            scale_begin.append(len(masks))
-            for i in range(G - s + 1):
-                for j in range(G - s + 1):
-                    masks.append(index_grid[i : i + s, j : j + s].reshape(-1))
-
-        self._masks = masks
-        self._scale_begin = scale_begin
-        self._n_windows_per_scale = [(self.grid_size - s + 1) ** 2 for s in self.scales]
+            m = F.unfold(grid.unsqueeze(0), kernel_size=s, stride=1)
+            masks.append(m.squeeze(0).long())
+        return masks
 
     # ------------------------------------------------------------------
-    # Feature extraction helpers
+    # Feature extraction
     # ------------------------------------------------------------------
 
-    def _encode_patches(self, images: torch.Tensor) -> torch.Tensor:
-        """Extract patch embeddings from CLIP's visual encoder (before transformer).
+    def _get_feature_map(self, images: torch.Tensor) -> torch.Tensor:
+        """Extract pre-transformer feature map (CLS + patches + pos embed).
 
-        Returns shape ``(N, grid_size**2, width)`` — no CLS token.
+        Returns ``(N, 1+G*G, width)``.
         """
         vit = self.clip.visual
-        # conv1: (N, 3, H, W) -> (N, width, G, G)
-        x = vit.conv1(images)
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # (N, width, G*G)
-        x = x.permute(0, 2, 1)  # (N, G*G, width)
-        # Add positional embedding (skip CLS token position at index 0)
-        x = x + vit.positional_embedding.to(x.dtype)[1:, :]
+        dtype = vit.conv1.weight.dtype
+        x = images.to(dtype)
+
+        x = vit.conv1(x)  # (N, W, G, G)
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # (N, W, G*G)
+        x = x.permute(0, 2, 1)  # (N, G*G, W)
+
+        cls = vit.class_embedding.to(dtype)
+        cls = cls.unsqueeze(0).unsqueeze(0).expand(x.shape[0], 1, -1)
+        x = torch.cat([cls, x], dim=1)  # (N, 1+G*G, W)
+        x = x + vit.positional_embedding.to(dtype)
         return x
 
-    def _forward_windows(self, patch_tokens: torch.Tensor) -> list[torch.Tensor]:
-        """Run windowed patch tokens through the CLIP ViT and return per-window CLS features.
+    def _run_transformer(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Run tokens through patch_dropout -> ln_pre -> transformer -> ln_post -> pool -> proj.
 
         Parameters
         ----------
-        patch_tokens : Tensor, shape (N, G*G, width)
-            Patch embeddings (without CLS token).
+        tokens : (B, L, W)
 
         Returns
         -------
-        list of Tensor
-            One feature tensor per window, each of shape (N, embed_dim_out).
-            Ordered: all windows for scale[0], then scale[1], etc.
+        (B, D) -- projected CLS embeddings.
         """
         vit = self.clip.visual
-        device = patch_tokens.device
-        dtype = patch_tokens.dtype
-        N = patch_tokens.shape[0]
+        x = vit.patch_dropout(tokens)
+        x = vit.ln_pre(x)
+        x = vit.transformer(x)
+        x = vit.ln_post(x)
+        pooled, _ = vit._global_pool(x)
+        if vit.proj is not None:
+            pooled = pooled @ vit.proj
+        return pooled
 
-        all_features: list[torch.Tensor] = []
+    def _get_window_embeddings(
+        self,
+        feature_map: torch.Tensor,
+        masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute embeddings for each window position at one scale.
 
-        for scale_idx, s in enumerate(self.scales):
-            begin = self._scale_begin[scale_idx]
-            end = (
-                self._scale_begin[scale_idx + 1]
-                if scale_idx + 1 < len(self._scale_begin)
-                else len(self._masks)
+        Masks and applies the transformer to each sliding-window subset,
+        matching the anomalib reference implementation.
+
+        Parameters
+        ----------
+        feature_map : (N, 1+G*G, W) -- pre-transformer features with CLS.
+        masks : (s*s, n_windows) -- patch indices per window.
+
+        Returns
+        -------
+        (N, n_windows, D) -- per-window embeddings.
+        """
+        N = feature_map.shape[0]
+        n_windows = masks.shape[1]
+        device = feature_map.device
+
+        # Prepend CLS index (0) to each mask; shift patch indices by +1
+        cls_idx = torch.zeros(1, n_windows, dtype=torch.long, device=device)
+        full_masks = torch.cat(
+            [cls_idx, masks.to(device) + 1], dim=0
+        ).T  # (n_win, s*s+1)
+
+        all_pooled: list[torch.Tensor] = []
+
+        for chunk_start in range(0, n_windows, self.win_chunk_size):
+            chunk_end = min(chunk_start + self.win_chunk_size, n_windows)
+            chunk_masks = full_masks[chunk_start:chunk_end]  # (n_chunk, s*s+1)
+
+            # Gather masked tokens -> (n_chunk * N, s*s+1, W)
+            masked = torch.cat(
+                [torch.index_select(feature_map, 1, m) for m in chunk_masks],
+                dim=0,
             )
-            scale_masks = self._masks[begin:end]
-            n_win = len(scale_masks)
 
-            if n_win == 0:
-                continue
+            pooled = self._run_transformer(masked)  # (n_chunk * N, D)
+            n_chunk = chunk_masks.shape[0]
+            pooled = pooled.reshape(n_chunk, N, -1)
+            all_pooled.append(pooled)
 
-            # Gather window patches: (n_win, N, s*s, width)
-            win_tokens = []
-            for mask in scale_masks:
-                mask_dev = mask.to(device)
-                # (N, s*s, width)
-                gathered = torch.gather(
-                    patch_tokens,
-                    dim=1,
-                    index=mask_dev.unsqueeze(0)
-                    .unsqueeze(-1)
-                    .expand(N, s * s, patch_tokens.shape[-1]),
-                )
-                win_tokens.append(gathered)
+        # (n_windows, N, D) -> (N, n_windows, D)
+        return torch.cat(all_pooled, dim=0).permute(1, 0, 2)
 
-            # Stack and reshape for batch processing:
-            # (n_win, N, s*s, W) -> (n_win * N, s*s, W)
-            mx = torch.stack(win_tokens, dim=0)  # (n_win, N, s*s, W)
-            mx = mx.reshape(n_win * N, s * s, mx.shape[-1])
+    @torch.no_grad()
+    def encode_image(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        """Encode images -> image, window, and patch embeddings.
 
-            # Prepend CLS token with positional embedding[0]
-            cls_token = (
-                vit.class_embedding.to(dtype) + vit.positional_embedding.to(dtype)[0, :]
-            )
-            cls_tokens = cls_token.unsqueeze(0).expand(n_win * N, 1, -1)
-            mx = torch.cat([cls_tokens, mx], dim=1)  # (n_win*N, s*s+1, W)
+        Returns
+        -------
+        image_embeddings : (N, D)
+        window_embeddings : list of (N, n_windows, D), one per scale
+        patch_embeddings : (N, G*G, D)
+        """
+        feature_map = self._get_feature_map(images)  # (N, 1+G*G, W)
 
-            # Pre-LN
-            mx = vit.ln_pre(mx)
+        # Full-image forward -> image embeddings + patch embeddings
+        vit = self.clip.visual
+        x = vit.patch_dropout(feature_map)
+        x = vit.ln_pre(x)
+        x = vit.transformer(x)  # (N, 1+G*G, W)
+        x = vit.ln_post(x)
+        image_emb, _ = vit._global_pool(x)
+        if vit.proj is not None:
+            image_emb = image_emb @ vit.proj  # (N, D)
+            patch_emb = x[:, 1:, :] @ vit.proj  # (N, G*G, D)
+        else:
+            patch_emb = x[:, 1:, :]
 
-            # Transformer (expects LND format)
-            mx = mx.permute(1, 0, 2)  # (s*s+1, n_win*N, W)
-            mx = vit.transformer(mx)
-            mx = mx.permute(1, 0, 2)  # (n_win*N, s*s+1, W)
+        # Window embeddings per scale (re-runs transformer on masked subsets)
+        window_embs = [
+            self._get_window_embeddings(feature_map, masks)
+            for masks in self._masks_per_scale
+        ]
 
-            # CLS token pooling + post-LN + projection
-            pooled = mx[:, 0, :]  # (n_win*N, W)
-            pooled = vit.ln_post(pooled)
-            if vit.proj is not None:
-                pooled = pooled @ vit.proj  # (n_win*N, output_dim)
-
-            # Reshape back: (n_win, N, output_dim)
-            pooled = pooled.reshape(n_win, N, -1)
-
-            # L2-normalize each feature
-            pooled = F.normalize(pooled, dim=-1)
-
-            # Append per-window features
-            for w in range(n_win):
-                all_features.append(pooled[w])  # (N, output_dim)
-
-        return all_features
+        return image_emb, window_embs, patch_emb
 
     # ------------------------------------------------------------------
-    # Text feature construction (Section 3.1)
+    # Text features (Sec. 3.1)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def build_text_features(self, category: str) -> None:
-        """Build compositional prompt ensemble text features.
-
-        For each (template × state) combination, encode the text and average
-        over all combinations to get a single normal and abnormal text feature.
-        """
+        """Build compositional prompt ensemble text features."""
         device = next(self.clip.parameters()).device
 
         normal_phrases: list[str] = []
         abnormal_phrases: list[str] = []
-
         for template in TEMPLATES:
             for state in STATE_NORMAL:
                 normal_phrases.append(template.format(state.format(category)))
             for state in STATE_ABNORMAL:
                 abnormal_phrases.append(template.format(state.format(category)))
 
-        # Tokenize and encode
         normal_tokens = self.tokenizer(normal_phrases).to(device)
         abnormal_tokens = self.tokenizer(abnormal_phrases).to(device)
 
-        normal_feats = self.clip.encode_text(normal_tokens)  # (M, D)
-        abnormal_feats = self.clip.encode_text(abnormal_tokens)  # (K, D)
+        normal_feats = self.clip.encode_text(normal_tokens)
+        abnormal_feats = self.clip.encode_text(abnormal_tokens)
 
-        # Average over all prompt combinations
-        avg_normal = normal_feats.mean(dim=0, keepdim=True)  # (1, D)
-        avg_abnormal = abnormal_feats.mean(dim=0, keepdim=True)  # (1, D)
+        avg_normal = normal_feats.mean(dim=0, keepdim=True)
+        avg_abnormal = abnormal_feats.mean(dim=0, keepdim=True)
 
-        # Concatenate and L2-normalize
-        text_feats = torch.cat([avg_normal, avg_abnormal], dim=0)  # (2, D)
-        text_feats = F.normalize(text_feats, dim=-1)
-        self.text_features = text_feats
+        # Store WITHOUT pre-normalisation; _class_scores normalises at score time
+        self.text_features = torch.cat([avg_normal, avg_abnormal], dim=0)
         self._text_ready = True
 
     # ------------------------------------------------------------------
-    # Visual gallery construction (WinCLIP+ — Section 3.3)
+    # Visual gallery (WinCLIP+ -- Sec. 3.3)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def build_visual_gallery(self, normal_images: torch.Tensor) -> None:
-        """Build per-scale visual feature galleries from normal reference images.
+        """Build per-scale visual + patch embeddings from normal images.
 
-        Parameters
-        ----------
-        normal_images : Tensor, shape (K, 3, H, W)
-            A batch of normal training images.
+        Stores:
+        - ``_visual_embeddings``: list of (K, n_windows, D) per scale.
+        - ``_patch_embeddings``: (K, G*G, D).
         """
-        patch_tokens = self._encode_patches(normal_images)
-        window_features = self._forward_windows(patch_tokens)
+        K = normal_images.shape[0]
+        all_window_embs: list[list[torch.Tensor]] = [[] for _ in self.scales]
+        all_patch_embs: list[torch.Tensor] = []
 
-        # Group features by scale and concatenate across all normal images
-        self.visual_gallery = []
-        for scale_idx in range(len(self.scales)):
-            begin = self._scale_begin[scale_idx]
-            end = (
-                self._scale_begin[scale_idx + 1]
-                if scale_idx + 1 < len(self._scale_begin)
-                else len(self._masks)
-            )
-            # Each window_features[i] is (K, D); stack and concatenate
-            scale_feats = torch.cat(
-                [window_features[i] for i in range(begin, end)],
-                dim=0,
-            )  # (n_windows * K, D)
-            self.visual_gallery.append(scale_feats)
+        for i in range(K):
+            img = normal_images[i : i + 1]
+            _, win_embs, patch_emb = self.encode_image(img)
+            for s_idx, we in enumerate(win_embs):
+                all_window_embs[s_idx].append(we.cpu())
+            all_patch_embs.append(patch_emb.cpu())
+
+        device = normal_images.device
+        self._visual_embeddings = [
+            torch.cat(wes, dim=0).to(device) for wes in all_window_embs
+        ]
+        self._patch_embeddings = torch.cat(all_patch_embs, dim=0).to(device)
 
     # ------------------------------------------------------------------
-    # Anomaly scoring
+    # Scoring
     # ------------------------------------------------------------------
 
-    def _textual_anomaly_map(
+    def _compute_zero_shot_scores(
         self,
-        window_features: list[torch.Tensor],
+        image_scores: torch.Tensor,
+        window_embeddings: list[torch.Tensor],
     ) -> torch.Tensor:
-        """Compute per-patch anomaly scores from text-visual alignment.
+        """Zero-shot multi-scale anomaly map (Sec. 3.2).
 
-        For each window, compute softmax over (normal, abnormal) text similarity.
-        Anomaly score = 1/p_normal. Average across windows within a scale, then
-        average across scales (Equation in Sec. 3.2).
+        Full-image CLS score is an additional scale level. Harmonic aggregation
+        within each scale; harmonic mean across scales.
 
-        Returns shape (N, 1, grid_size, grid_size).
+        Returns (N, G, G).
         """
-        N = window_features[0].shape[0]
         G = self.grid_size
+        multi_scale: list[torch.Tensor] = [
+            image_scores.view(-1, 1, 1).expand(-1, G, G),
+        ]
 
-        scale_maps: list[torch.Tensor] = []
-
-        for scale_idx, s in enumerate(self.scales):
-            begin = self._scale_begin[scale_idx]
-            end = (
-                self._scale_begin[scale_idx + 1]
-                if scale_idx + 1 < len(self._scale_begin)
-                else len(self._masks)
+        for win_emb, masks in zip(window_embeddings, self._masks_per_scale):
+            scores = _class_scores(
+                win_emb,
+                self.text_features,
+                TEMPERATURE,
+                target_class=1,
+            )
+            multi_scale.append(
+                _harmonic_aggregation(scores, G, masks.to(win_emb.device)),
             )
 
-            token_scores = torch.zeros(N, G * G, device=window_features[0].device)
-            token_weights = torch.zeros(N, G * G, device=window_features[0].device)
+        stacked = torch.stack(multi_scale, dim=0)
+        n_scales = stacked.shape[0]
+        return n_scales / (1.0 / stacked.clamp(min=1e-8)).sum(dim=0)
 
-            for win_idx in range(begin, end):
-                feats = window_features[win_idx]  # (N, D)
-                # Similarity with text features: (N, 2)
-                sim = 100.0 * feats @ self.text_features.T
-                probs = sim.softmax(dim=-1)  # (N, 2)
-                p_normal = probs[:, 0]  # (N,)
-
-                # Anomaly score = 1 / p_normal
-                score = 1.0 / p_normal  # (N,)
-
-                # Assign to covered patches
-                mask = self._masks[win_idx].to(feats.device)
-                for patch_idx in mask:
-                    token_scores[:, patch_idx] += score
-                    token_weights[:, patch_idx] += 1.0
-
-            # Average over overlapping windows
-            token_scores = token_scores / token_weights.clamp(min=1.0)
-            scale_maps.append(token_scores)
-
-        # Average across scales
-        scale_maps_t = torch.stack(scale_maps, dim=0)  # (n_scales, N, G*G)
-        avg_map = scale_maps_t.mean(dim=0)  # (N, G*G)
-
-        # Convert from 1/p_normal to anomaly probability: 1 - 1/(1/p_normal) = 1 - p_normal
-        avg_map = 1.0 - 1.0 / avg_map
-
-        return avg_map.reshape(N, 1, G, G)
-
-    def _visual_anomaly_map(
+    def _compute_few_shot_scores(
         self,
-        window_features: list[torch.Tensor],
+        patch_embeddings: torch.Tensor,
+        window_embeddings: list[torch.Tensor],
     ) -> torch.Tensor:
-        """Compute per-patch anomaly scores from visual gallery (WinCLIP+).
+        """Few-shot multi-scale anomaly map (Sec. 3.3).
 
-        For each window, find max cosine similarity to the corresponding
-        gallery features. Score = 0.5 * (1 - max_sim).
+        Uses visual association score (Eq. 4) at each scale, aggregated via
+        harmonic mean within scales, arithmetic mean across scales.
 
-        Returns shape (N, 1, grid_size, grid_size).
+        Returns (N, G, G).
         """
-        assert self.visual_gallery is not None
-        N = window_features[0].shape[0]
         G = self.grid_size
+        assert self._visual_embeddings is not None
+        assert self._patch_embeddings is not None
 
-        scale_maps: list[torch.Tensor] = []
+        multi_scale: list[torch.Tensor] = [
+            _visual_association_score(
+                patch_embeddings,
+                self._patch_embeddings,
+            ).reshape(-1, G, G),
+        ]
 
-        for scale_idx, s in enumerate(self.scales):
-            begin = self._scale_begin[scale_idx]
-            end = (
-                self._scale_begin[scale_idx + 1]
-                if scale_idx + 1 < len(self._scale_begin)
-                else len(self._masks)
+        for win_emb, ref_emb, masks in zip(
+            window_embeddings,
+            self._visual_embeddings,
+            self._masks_per_scale,
+        ):
+            scores = _visual_association_score(win_emb, ref_emb)
+            multi_scale.append(
+                _harmonic_aggregation(scores, G, masks.to(win_emb.device)),
             )
-            gallery = self.visual_gallery[scale_idx]  # (n_gallery, D)
 
-            token_scores = torch.zeros(N, G * G, device=window_features[0].device)
-            token_weights = torch.zeros(N, G * G, device=window_features[0].device)
-
-            for win_idx in range(begin, end):
-                feats = window_features[win_idx]  # (N, D)
-                # Max cosine similarity to gallery
-                sim = feats @ gallery.T  # (N, n_gallery)
-                max_sim = sim.max(dim=1)[0]  # (N,)
-                score = 0.5 * (1.0 - max_sim)  # (N,)
-
-                mask = self._masks[win_idx].to(feats.device)
-                for patch_idx in mask:
-                    token_scores[:, patch_idx] += score
-                    token_weights[:, patch_idx] += 1.0
-
-            token_scores = token_scores / token_weights.clamp(min=1.0)
-            scale_maps.append(token_scores)
-
-        scale_maps_t = torch.stack(scale_maps, dim=0)
-        avg_map = scale_maps_t.mean(dim=0)
-
-        return avg_map.reshape(N, 1, G, G)
+        return torch.stack(multi_scale, dim=0).mean(dim=0)
 
     # ------------------------------------------------------------------
     # Forward / predict
@@ -451,47 +522,58 @@ class WinCLIP(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run anomaly detection on a batch of images.
 
+        Processes one image at a time to bound peak memory.
+
         Parameters
         ----------
-        images : Tensor, shape (N, 3, H, W)
+        images : (N, 3, H, W)
 
         Returns
         -------
-        scores : Tensor, shape (N,)
-            Image-level anomaly scores (max of anomaly map).
-        anomaly_maps : Tensor, shape (N, 1, H, W)
-            Pixel-level anomaly maps upsampled to input resolution.
+        scores : (N,) image-level anomaly scores.
+        anomaly_maps : (N, H, W) pixel-level maps upsampled to input resolution.
         """
         assert self._text_ready, "Call build_text_features(category) first."
+        N, _, H, W = images.shape
 
-        H, W = images.shape[2], images.shape[3]
+        all_scores: list[torch.Tensor] = []
+        all_maps: list[torch.Tensor] = []
 
-        patch_tokens = self._encode_patches(images)
-        window_features = self._forward_windows(patch_tokens)
+        for i in range(N):
+            img = images[i : i + 1]
+            image_emb, win_embs, patch_emb = self.encode_image(img)
 
-        # Textual anomaly map (always available — zero-shot)
-        text_map = self._textual_anomaly_map(window_features)
-
-        if self.visual_gallery is not None:
-            # WinCLIP+: harmonic mean of textual and visual maps
-            vis_map = self._visual_anomaly_map(window_features)
-            # Harmonic mean: 1 / (1/a + 1/b) = ab / (a + b)
-            # Clamp to avoid division by zero
-            anomaly_map = 1.0 / (
-                1.0 / text_map.clamp(min=1e-8) + 1.0 / vis_map.clamp(min=1e-8)
+            # Full-image class score
+            image_score = _class_scores(
+                image_emb,
+                self.text_features,
+                TEMPERATURE,
+                target_class=1,
             )
-        else:
-            anomaly_map = text_map
 
-        # Upsample to input resolution
-        anomaly_map = F.interpolate(
-            anomaly_map, size=(H, W), mode="bilinear", align_corners=False
-        )
+            # Zero-shot anomaly map
+            zs_map = self._compute_zero_shot_scores(image_score, win_embs)
 
-        # Image-level score = max of anomaly map
-        scores = anomaly_map.reshape(images.shape[0], -1).max(dim=1)[0]
+            if self._visual_embeddings is not None:
+                fs_map = self._compute_few_shot_scores(patch_emb, win_embs)
+                anomaly_map = (zs_map + fs_map) / 2.0
+                image_score = (image_score + fs_map.amax(dim=(-2, -1))) / 2.0
+            else:
+                anomaly_map = zs_map
 
-        return scores, anomaly_map.squeeze(1)
+            anomaly_map = F.interpolate(
+                anomaly_map.unsqueeze(1),
+                size=(H, W),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+            all_scores.append(image_score.view(-1).cpu())
+            all_maps.append(anomaly_map.squeeze(0).squeeze(0).cpu())
+
+        scores = torch.cat(all_scores, dim=0).to(images.device)
+        anomaly_maps = torch.stack(all_maps, dim=0).to(images.device)
+        return scores, anomaly_maps
 
     def forward(
         self,

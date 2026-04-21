@@ -47,6 +47,8 @@ class WinCLIPModule(LightningModule):
         scales: tuple[int, ...] = (2, 3),
         image_size: int = 240,
         k_shot: int = 0,
+        win_chunk_size: int = 32,
+        use_half: bool = True,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -59,6 +61,8 @@ class WinCLIPModule(LightningModule):
             pretrained=pretrained,
             scales=scales,
             image_size=image_size,
+            win_chunk_size=win_chunk_size,
+            use_half=use_half,
         )
         self.category = category
         self.k_shot = k_shot
@@ -99,8 +103,13 @@ class WinCLIPModule(LightningModule):
     ) -> None:
         if self._gallery_built or self.k_shot == 0:
             return
+        # Only collect up to k_shot images to avoid wasting memory
+        collected = sum(x.shape[0] for x in self._train_images)
+        if collected >= self.k_shot:
+            return
         x = batch["image"]
-        self._train_images.append(x.cpu())
+        remaining = self.k_shot - collected
+        self._train_images.append(x[:remaining].cpu())
 
     def on_train_epoch_end(self) -> None:
         if self._gallery_built or self.k_shot == 0:
@@ -201,7 +210,8 @@ class WinCLIPModule(LightningModule):
             "hparams": dict(self.hparams),
             "text_features": self.model.text_features,
             "text_ready": self.model._text_ready,
-            "visual_gallery": self.model.visual_gallery,
+            "visual_embeddings": self.model._visual_embeddings,
+            "patch_embeddings": self.model._patch_embeddings,
         }
         torch.save(state, ckpt_dir / "model.ckpt")
 
