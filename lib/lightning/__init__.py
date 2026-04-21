@@ -5,6 +5,7 @@ from .dinomaly_module import DinomalyModule
 from .autoencoder_module import AutoencoderModule
 from .efficientad_module import EfficientAdModule
 from .patchcore_module import PatchCoreModule
+from .subspacead_module import SubspaceADModule
 from .winclip_module import WinCLIPModule
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "DinomalyModule",
     "EfficientAdModule",
     "PatchCoreModule",
+    "SubspaceADModule",
     "WinCLIPModule",
 ]

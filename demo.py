@@ -34,6 +34,7 @@ from lib.lightning import (
     AnomalyTIPSv2Module,
     DictASModule,
     PatchCoreModule,
+    SubspaceADModule,
     WinCLIPModule,
 )
 
@@ -111,6 +112,17 @@ METHODS: dict[str, MethodSpec] = {
         image_size=336,
         notes="Self-supervised class-generalizable FSAS (arXiv:2508.13560). "
         "Loads trained Key/Query/Value generators from checkpoints/dictas/.",
+    ),
+    "subspacead": MethodSpec(
+        key="subspacead",
+        label="SubspaceAD",
+        tagline="DINOv2 Giant • PCA subspace • training-free",
+        needs_nominal=True,
+        supports_nominal=True,
+        supports_zero_shot=False,
+        image_size=672,
+        notes="Training-free PCA subspace modeling on DINOv2-G features. "
+        "CVPR 2026 (arXiv:2602.23013). Few-shot SOTA on MVTec-AD and VisA.",
     ),
 }
 
@@ -332,6 +344,21 @@ def _fit_dictas(
     module._reference_images = imgs
 
 
+def build_subspacead(params: dict) -> SubspaceADModule:
+    return SubspaceADModule(
+        model_name=params.get("subspacead_backbone", "dinov2_vitg14"),
+        image_resolution=METHODS["subspacead"].image_size,
+        aug_count=int(params.get("subspacead_aug_count", 30)),
+        pca_variance_threshold=float(params.get("subspacead_pca_ev", 0.99)),
+        image_size=METHODS["subspacead"].image_size,
+    )
+
+
+def _fit_subspacead(module: SubspaceADModule, nominals: list[np.ndarray]) -> None:
+    module.to(DEVICE).eval()
+    module.model.fit(nominals)
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Predict helpers
 # ─────────────────────────────────────────────────────────────────────
@@ -377,6 +404,10 @@ def _predict_module(
         refs = refs.to(x.device).unsqueeze(0).expand(x.shape[0], -1, -1, -1, -1)
         scores, maps = module.model.predict(x, refs)
         return float(scores[0].cpu()), maps[0].cpu().numpy()
+
+    if method_key == "subspacead":
+        scores, maps = module.model.predict_batch_tensor(x, output_size=(size, size))
+        return float(scores[0].cpu()), maps[0, 0].cpu().numpy()
 
     raise ValueError(f"Unknown method: {method_key}")
 
@@ -551,6 +582,8 @@ def run_inference(
                 "k_shot": max(1, int(k_shot)) if nominal_imgs else 1,
             }
         )
+    elif method_key == "subspacead":
+        module = build_subspacead({})
     else:
         raise gr.Error(f"Unknown method: {method_key}")
 
@@ -568,6 +601,8 @@ def run_inference(
         _fit_winclip(module, nominal_imgs, category or "object")
     elif method_key == "dictas":
         _fit_dictas(module, nominal_imgs, category or "object")
+    elif method_key == "subspacead":
+        _fit_subspacead(module, nominal_imgs)
     t_fit = time.perf_counter() - t1
 
     progress(0.75, desc="Running inference")
@@ -649,7 +684,7 @@ def run_inference(
 # ─────────────────────────────────────────────────────────────────────
 
 INDUSTRIAL_CSS = """
-/* ---------- root tokens — DARK (default) ---------- */
+/* ---------- root tokens — DARK ---------- */
 :root, .dark {
   --iad-bg-0: #0a0c10;
   --iad-bg-1: #10141b;
@@ -673,6 +708,32 @@ INDUSTRIAL_CSS = """
   --iad-log-fg: var(--iad-accent-bright);
   --iad-shadow: 0 6px 18px rgba(255, 176, 32, 0.15);
   --iad-shadow-hover: 0 10px 24px rgba(255, 176, 32, 0.28);
+}
+
+/* ---------- root tokens — OCTO (default, corporate) ---------- */
+html.iad-octo, html.iad-octo :root {
+  --iad-bg-0: #ffffff;       /* white backdrop */
+  --iad-bg-1: #f7f9fc;
+  --iad-bg-2: #ffffff;
+  --iad-bg-3: #eef2f8;
+  --iad-line: #d5dbe6;
+  --iad-line-bright: #0E2356;
+  --iad-text: #0E2356;       /* octo navy */
+  --iad-text-dim: #4a5878;
+  --iad-accent: #00D2DD;     /* octo turquoise */
+  --iad-accent-bright: #25AAC6; /* turquoise old */
+  --iad-accent-on: #0E2356;
+  --iad-ok: #1f7a3a;
+  --iad-ok-dim: #d5ead7;
+  --iad-danger: #b91c1c;
+  --iad-danger-dim: #f7dcdc;
+  --iad-info: #0E2356;
+  --iad-grid-opacity: 0.06;
+  --iad-stripe-dark: #0E2356;
+  --iad-log-bg: #0E2356;
+  --iad-log-fg: #00D2DD;
+  --iad-shadow: 0 6px 14px rgba(14, 35, 86, 0.18);
+  --iad-shadow-hover: 0 10px 22px rgba(0, 210, 221, 0.3);
 }
 
 /* ---------- root tokens — LIGHT (engineering blueprint) ---------- */
@@ -710,6 +771,17 @@ gradio-app, .gradio-container, body {
   font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, SFMono-Regular,
     Menlo, monospace !important;
 }
+/* OCTO uses Outfit, a humanist corporate sans (not monospace). */
+html.iad-octo gradio-app,
+html.iad-octo .gradio-container,
+html.iad-octo body {
+  font-family: 'Outfit', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif !important;
+}
+html.iad-octo .iad-log textarea,
+html.iad-octo .iad-verdict {
+  font-family: 'Outfit', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif !important;
+}
+
 .gradio-container::before {
   content: "";
   position: fixed;
@@ -778,52 +850,69 @@ gradio-app, .gradio-container, body {
   opacity: 0.9;
 }
 
-/* ---------- theme toggle ---------- */
+/* ---------- theme selector (dropdown) ---------- */
 .iad-header-right {
   display: flex; align-items: center; gap: 14px;
 }
-.iad-theme-toggle {
+/*
+ * Solid, opaque pill so the header's diagonal hatch background
+ * never shows through — and text uses the theme's high-contrast
+ * text colour (not the accent, which blends with the safety-stripe
+ * decoration next to it).
+ */
+.iad-theme-select-wrap {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 7px 14px;
+  gap: 10px;
+  padding: 5px 10px 5px 12px;
+  border: 1.5px solid var(--iad-line-bright);
+  border-radius: 5px;
+  background: var(--iad-bg-0);
   font-family: inherit;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.18em;
   text-transform: uppercase;
-  background: #1a1f28;
-  color: #ffb020;
-  border: 1.5px solid #3a4452;
-  border-radius: 5px;
+  color: var(--iad-text);
+  box-shadow: inset 0 0 0 1px var(--iad-bg-0);
+  transition: border-color 0.15s ease, background 0.2s ease;
+}
+.iad-theme-select-wrap:hover { border-color: var(--iad-accent); }
+.iad-theme-select-wrap .iad-tg-label {
+  color: var(--iad-text-dim);
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  padding-right: 8px;
+  border-right: 1px solid var(--iad-line);
+}
+#iad-theme-select {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--iad-text);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  padding: 2px 20px 2px 0;
   cursor: pointer;
-  transition: border-color 0.15s ease, transform 0.08s ease,
-             background 0.2s ease, color 0.2s ease;
+  /* Accent-coloured chevron — only the arrow uses the accent hue. */
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--iad-accent) 50%),
+    linear-gradient(135deg, var(--iad-accent) 50%, transparent 50%);
+  background-position:
+    calc(100% - 11px) 52%,
+    calc(100% - 6px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
 }
-.iad-theme-toggle:hover {
-  border-color: #ffb020;
-  transform: translateY(-1px);
-  background: #222a36;
+#iad-theme-select option {
+  background: var(--iad-bg-0);
+  color: var(--iad-text);
 }
-.iad-theme-toggle svg {
-  width: 16px; height: 16px;
-  flex-shrink: 0;
-}
-.iad-theme-toggle .iad-icon-sun { display: none; }
-.iad-theme-toggle .iad-icon-moon { display: block; }
-html.iad-light .iad-theme-toggle {
-  background: #ffffff !important;
-  color: #c25200 !important;
-  border-color: #b0a898 !important;
-}
-html.iad-light .iad-theme-toggle:hover {
-  border-color: #c25200 !important;
-  background: #f7f5ef !important;
-}
-html.iad-light .iad-theme-toggle svg { color: #c25200; }
-html.iad-light .iad-theme-toggle .iad-icon-sun { display: block; }
-html.iad-light .iad-theme-toggle .iad-icon-moon { display: none; }
 
 /* ---------- panels / cards ---------- */
 .iad-panel {
@@ -1152,7 +1241,113 @@ html.iad-light h2,
 html.iad-light h3 {
   color: inherit;
 }
-/* Theme toggle — light overrides are in the main .iad-theme-toggle block */
+/* ========== OCTO MODE ========== */
+/* Pale/corporate palette: white surface, turquoise line accents, navy text. */
+html.iad-octo gradio-app,
+html.iad-octo .gradio-container,
+html.iad-octo body {
+  background: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%) !important;
+  color: var(--iad-text) !important;
+}
+html.iad-octo {
+  --body-text-color: var(--iad-text);
+  --body-text-color-subdued: var(--iad-text-dim);
+  --background-fill-primary: var(--iad-bg-1);
+  --background-fill-secondary: var(--iad-bg-2);
+  --block-background-fill: var(--iad-bg-2);
+  --block-border-color: var(--iad-line);
+  --block-label-background-fill: var(--iad-bg-1);
+  --block-label-text-color: var(--iad-text-dim);
+  --block-title-text-color: var(--iad-text);
+  --border-color-primary: var(--iad-line);
+  --input-background-fill: #ffffff;
+  --input-border-color: var(--iad-line);
+  --panel-background-fill: var(--iad-bg-2);
+  --body-background-fill: var(--iad-bg-0);
+  --checkbox-border-color: var(--iad-line);
+  --neutral-50: #ffffff;
+  --neutral-100: var(--iad-bg-1);
+  --neutral-200: var(--iad-bg-3);
+  --neutral-300: var(--iad-line);
+  --neutral-400: var(--iad-text-dim);
+  --neutral-500: var(--iad-text-dim);
+  --neutral-600: var(--iad-text);
+  --neutral-700: var(--iad-text);
+  --neutral-800: var(--iad-text);
+  --neutral-900: var(--iad-text);
+  --neutral-950: var(--iad-text);
+  --color-accent: var(--iad-accent);
+  --color-accent-soft: var(--iad-bg-3);
+  --slider-color: var(--iad-accent);
+}
+html.iad-octo span,
+html.iad-octo p,
+html.iad-octo div,
+html.iad-octo h1,
+html.iad-octo h2,
+html.iad-octo h3 { color: inherit; }
+
+/* Softer OCTO header — pale navy/turquoise stripe instead of high-contrast diagonal. */
+html.iad-octo .iad-header {
+  background: #ffffff !important;
+  border-color: var(--iad-line) !important;
+  box-shadow: 0 2px 6px rgba(14, 35, 86, 0.06);
+}
+html.iad-octo .iad-stripes {
+  background: linear-gradient(90deg, var(--iad-accent) 0%, var(--iad-text) 100%);
+  opacity: 1;
+}
+html.iad-octo .iad-logo {
+  background: var(--iad-text);
+  color: #ffffff;
+  border-color: var(--iad-text);
+  box-shadow: inset 0 0 0 2px #ffffff;
+}
+html.iad-octo .iad-title { color: var(--iad-text); }
+html.iad-octo .iad-subtitle { color: var(--iad-text-dim); }
+
+/* Section titles in navy, turquoise dot — mirrors typst heading colors. */
+html.iad-octo .iad-section-title {
+  color: var(--iad-text);
+  border-bottom-color: var(--iad-accent);
+}
+html.iad-octo .iad-section-title::before {
+  background: var(--iad-accent);
+  box-shadow: 0 0 6px var(--iad-accent);
+}
+
+/* Metrics left-accent stays turquoise (already uses --iad-accent). */
+
+/* Primary button — turquoise gradient on navy text. */
+html.iad-octo button.primary,
+html.iad-octo .gr-button-primary,
+html.iad-octo button[variant="primary"] {
+  background: linear-gradient(180deg, var(--iad-accent) 0%, var(--iad-accent-bright) 100%) !important;
+  color: var(--iad-accent-on) !important;
+  border: 1px solid var(--iad-accent-bright) !important;
+  box-shadow: 0 4px 10px rgba(0, 210, 221, 0.25);
+}
+
+/* Method tagline uses navy border-left on OCTO, keeping accent readable. */
+html.iad-octo .iad-method-tagline { border-left-color: var(--iad-text); }
+html.iad-octo .iad-method-notes { border-color: var(--iad-line-bright); }
+
+/* Verdict pulsing dot ring contrasts against white. */
+html.iad-octo .iad-badge-dot {
+  box-shadow: 0 0 0 3px rgba(14, 35, 86, 0.12), 0 0 14px currentColor;
+}
+
+/* Accordion / inline widget color */
+html.iad-octo .iad-accordion > button,
+html.iad-octo .iad-accordion summary { color: var(--iad-text) !important; }
+
+/* Theme selector: explicit navy text for OCTO so it reads on white. */
+html.iad-octo .iad-theme-select-wrap {
+  background: #ffffff;
+  border-color: var(--iad-line);
+  color: var(--iad-text);
+}
+html.iad-octo #iad-theme-select { color: var(--iad-text); }
 """
 
 
@@ -1226,48 +1421,65 @@ HEADER_HTML = """
     </div>
   </div>
   <div class="iad-header-right">
-    <div class="iad-stripes" title="safety stripes"></div>
-    <button id="iad-theme-toggle" class="iad-theme-toggle" type="button">
-      <svg class="iad-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-      <svg class="iad-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    <label class="iad-theme-select-wrap" for="iad-theme-select">
       <span class="iad-tg-label">THEME</span>
-    </button>
+      <select id="iad-theme-select" aria-label="Theme">
+        <option value="octo">OCTO</option>
+        <option value="dark">DARK</option>
+        <option value="light">LIGHT</option>
+      </select>
+    </label>
   </div>
 </div>
 """
 
 
-# Injected into <head>; guaranteed to execute once the page loads.
+# Injected into <head>; runs early so the chosen theme class is applied
+# before Gradio components mount, preventing any flash of the wrong theme.
 THEME_TOGGLE_HEAD = """
 <script>
 (function() {
-  function applySaved() {
-    try {
-      var saved = localStorage.getItem('iad-theme');
-      if (saved === 'light') document.documentElement.classList.add('iad-light');
-      else document.documentElement.classList.remove('iad-light');
-    } catch (e) {}
-  }
-  applySaved();
+  var THEMES = ['octo', 'dark', 'light'];
+  var DEFAULT_THEME = 'octo';
 
-  function bindToggle() {
-    var btn = document.getElementById('iad-theme-toggle');
-    if (!btn || btn.dataset.bound === '1') return false;
-    btn.dataset.bound = '1';
-    btn.addEventListener('click', function() {
-      var h = document.documentElement;
-      var isLight = h.classList.toggle('iad-light');
-      try { localStorage.setItem('iad-theme', isLight ? 'light' : 'dark'); } catch (e) {}
+  function readSaved() {
+    try {
+      var v = localStorage.getItem('iad-theme');
+      if (THEMES.indexOf(v) !== -1) return v;
+    } catch (e) {}
+    return DEFAULT_THEME;
+  }
+
+  function applyTheme(name) {
+    var h = document.documentElement;
+    THEMES.forEach(function(t) { h.classList.remove('iad-' + t); });
+    // 'dark' uses the base :root tokens — no class needed, but we tag it
+    // anyway for potential future selectors.
+    h.classList.add('iad-' + name);
+    try { localStorage.setItem('iad-theme', name); } catch (e) {}
+  }
+
+  // Apply immediately on script evaluation (pre-mount).
+  applyTheme(readSaved());
+
+  function bindSelect() {
+    var sel = document.getElementById('iad-theme-select');
+    if (!sel || sel.dataset.bound === '1') return false;
+    sel.dataset.bound = '1';
+    // Sync current value with the <select> UI.
+    sel.value = readSaved();
+    sel.addEventListener('change', function(e) {
+      applyTheme(e.target.value);
     });
     return true;
   }
-  // Gradio mounts components asynchronously — poll briefly until the button exists.
+  // Gradio mounts asynchronously — poll briefly until the <select> exists.
   var tries = 0;
   var t = setInterval(function() {
-    if (bindToggle() || ++tries > 60) clearInterval(t);
+    if (bindSelect() || ++tries > 60) clearInterval(t);
   }, 100);
-  // Also observe future re-mounts (e.g. during reloads).
-  var mo = new MutationObserver(function() { bindToggle(); });
+  // Re-bind on dynamic re-mounts (e.g. hot reload).
+  var mo = new MutationObserver(function() { bindSelect(); });
   mo.observe(document.body, { childList: true, subtree: true });
 })();
 </script>

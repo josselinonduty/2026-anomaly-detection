@@ -35,6 +35,7 @@ from lib.lightning import (
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
+    SubspaceADModule,
     WinCLIPModule,
 )
 from lib.utils.checkpoint import latest_checkpoint_dir
@@ -52,6 +53,7 @@ _LOADER_MAP = {
     "anomalytipsv2": AnomalyTIPSv2Module,
     "winclip": WinCLIPModule,
     "dictas": DictASModule,
+    "subspacead": SubspaceADModule,
 }
 
 
@@ -79,6 +81,7 @@ def parse_args() -> argparse.Namespace:
             "anomalytipsv2",
             "winclip",
             "dictas",
+            "subspacead",
         ],
         help="Model architecture to use.",
     )
@@ -200,6 +203,13 @@ def _predict_dictas(model: DictASModule, images: torch.Tensor) -> torch.Tensor:
     return anomaly_maps
 
 
+@torch.no_grad()
+def _predict_subspacead(model: SubspaceADModule, images: torch.Tensor) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model(images)
+    return anomaly_maps[:, 0]
+
+
 _PREDICT_FN = {
     "autoencoder": _predict_autoencoder,
     "patchcore": _predict_patchcore,
@@ -209,6 +219,7 @@ _PREDICT_FN = {
     "anomalytipsv2": _predict_anomalytipsv2,
     "winclip": _predict_winclip,
     "dictas": _predict_dictas,
+    "subspacead": _predict_subspacead,
 }
 
 
@@ -326,6 +337,13 @@ def main() -> None:
         )
     elif args.model == "dictas":
         image_size = 336
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
+    elif args.model == "subspacead":
+        image_size = 672
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),
             eval_transform=get_eval_transforms(image_size),

@@ -5,6 +5,7 @@ from .dictas import DictAS
 from .dinomaly import Dinomaly, build_dinomaly
 from .efficientad import get_autoencoder, get_pdn_medium, get_pdn_small
 from .patchcore import PatchCore
+from .subspacead import SubspaceAD
 from .winclip import WinCLIP
 
 __all__ = [
@@ -14,6 +15,7 @@ __all__ = [
     "DictAS",
     "Dinomaly",
     "PatchCore",
+    "SubspaceAD",
     "WinCLIP",
     "build_dinomaly",
     "get_autoencoder",

@@ -35,6 +35,7 @@ from lib.lightning import (
     DinomalyModule,
     EfficientAdModule,
     PatchCoreModule,
+    SubspaceADModule,
     WinCLIPModule,
 )
 from lib.lightning.callbacks import InferenceSpeedMonitor, MemoryMonitor
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
             "anomalytipsv2",
             "winclip",
             "dictas",
+            "subspacead",
         ],
         help="Model architecture to use.",
     )
@@ -118,6 +120,45 @@ def parse_args() -> argparse.Namespace:
         default="small",
         choices=["small", "medium"],
         help="PDN variant for EfficientAd (small or medium).",
+    )
+
+    # SubspaceAD-specific
+    parser.add_argument(
+        "--subspacead_backbone",
+        type=str,
+        default="dinov2_vitg14",
+        choices=[
+            "dinov2_vits14",
+            "dinov2_vitb14",
+            "dinov2_vitl14",
+            "dinov2_vitg14",
+        ],
+        help="DINOv2 backbone for SubspaceAD (default Giant).",
+    )
+    parser.add_argument(
+        "--subspacead_resolution",
+        type=int,
+        default=672,
+        help="Input resolution for SubspaceAD (default 672).",
+    )
+    parser.add_argument(
+        "--subspacead_layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help="DINOv2 layers to average for SubspaceAD (default: auto middle-7).",
+    )
+    parser.add_argument(
+        "--subspacead_pca_ev",
+        type=float,
+        default=0.99,
+        help="PCA explained variance threshold τ for SubspaceAD (default 0.99).",
+    )
+    parser.add_argument(
+        "--subspacead_aug_count",
+        type=int,
+        default=30,
+        help="Number of random rotations per normal image (SubspaceAD, default 30).",
     )
 
     # AnomalyDINO-specific
@@ -317,6 +358,7 @@ def main() -> None:
         | AnomalyTIPSv2Module
         | WinCLIPModule
         | DictASModule
+        | SubspaceADModule
     )
     if args.model == "patchcore":
         model = PatchCoreModule(
@@ -457,6 +499,35 @@ def main() -> None:
         )
         if args.max_epochs is None:
             args.max_epochs = 30  # Appendix A.4
+    elif args.model == "subspacead":
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        subspacead_resolution = args.subspacead_resolution
+        subspacead_transform = get_eval_transforms(subspacead_resolution)
+        subspacead_mask_transform = get_mask_transforms(subspacead_resolution)
+        extra_dm_kwargs.update(
+            train_transform=subspacead_transform,
+            eval_transform=subspacead_transform,
+            mask_transform=subspacead_mask_transform,
+        )
+        datamodule = VisADataModule(
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=subspacead_resolution,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = subspacead_resolution
+        model = SubspaceADModule(
+            model_name=args.subspacead_backbone,
+            image_resolution=subspacead_resolution,
+            layers=tuple(args.subspacead_layers) if args.subspacead_layers else None,
+            pca_variance_threshold=args.subspacead_pca_ev,
+            aug_count=args.subspacead_aug_count,
+            image_size=subspacead_resolution,
+        )
+        args.max_epochs = 1
     elif args.model == "anomalytipsv2":
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
