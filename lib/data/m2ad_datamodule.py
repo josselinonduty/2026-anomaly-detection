@@ -169,6 +169,15 @@ class M2ADDataModule:
     def setup(self, stage: str | None = None) -> None:
         normal_samples, anomalous_samples = self._build_samples()
 
+        if not normal_samples:
+            cat_dir = self.dataset_root / self.category
+            raise FileNotFoundError(
+                f"No images found for category '{self.category}' under "
+                f"{cat_dir}. Download the M2AD dataset from "
+                f"https://huggingface.co/datasets/ChengYuQi99/M2AD and "
+                f"extract it into {self.dataset_root}."
+            )
+
         # Validation: 10 % of normal + 10 % of anomalous
         rng = np.random.RandomState(42)
 
