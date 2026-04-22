@@ -22,7 +22,8 @@ import torch
 import torch.nn.functional as F
 
 from lib.data import (
-    VisADataModule,
+    DATASET_NAMES,
+    create_datamodule,
     get_dinomaly_mask_transforms,
     get_dinomaly_transforms,
 )
@@ -58,10 +59,17 @@ _LOADER_MAP = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="VisA Anomaly Detection — Inference")
+    parser = argparse.ArgumentParser(description="Anomaly Detection — Inference")
 
     # Data
-    parser.add_argument("--dataset_root", type=str, default="datasets/visa")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="visa",
+        choices=DATASET_NAMES,
+        help="Dataset to use (default: visa).",
+    )
+    parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--category", type=str, default="candle")
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -350,7 +358,8 @@ def main() -> None:
             mask_transform=get_mask_transforms(image_size),
         )
 
-    datamodule = VisADataModule(
+    datamodule = create_datamodule(
+        args.dataset,
         dataset_root=args.dataset_root,
         category=args.category,
         image_size=image_size,

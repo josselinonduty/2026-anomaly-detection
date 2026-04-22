@@ -23,7 +23,8 @@ from pytorch_lightning.strategies import SingleDeviceStrategy
 
 from lib.accelerators import XPUAccelerator
 from lib.data import (
-    VisADataModule,
+    DATASET_NAMES,
+    create_datamodule,
     get_dinomaly_mask_transforms,
     get_dinomaly_transforms,
 )
@@ -43,10 +44,17 @@ from lib.utils.checkpoint import make_checkpoint_dir, save_metadata
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="VisA Anomaly Detection")
+    parser = argparse.ArgumentParser(description="Anomaly Detection")
 
     # Data
-    parser.add_argument("--dataset_root", type=str, default="datasets/visa")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="visa",
+        choices=DATASET_NAMES,
+        help="Dataset to use (default: visa).",
+    )
+    parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--category", type=str, default="candle")
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -339,7 +347,8 @@ def main() -> None:
         )
         args.batch_size = min(args.batch_size, 16)  # paper default
 
-    datamodule = VisADataModule(
+    datamodule = create_datamodule(
+        args.dataset,
         dataset_root=args.dataset_root,
         category=args.category,
         image_size=args.image_size,
@@ -417,7 +426,8 @@ def main() -> None:
             eval_transform=anomalydino_transform,
             mask_transform=anomalydino_mask_transform,
         )
-        datamodule = VisADataModule(
+        datamodule = create_datamodule(
+            args.dataset,
             dataset_root=args.dataset_root,
             category=args.category,
             image_size=args.smaller_edge_size,
@@ -445,7 +455,8 @@ def main() -> None:
             eval_transform=winclip_transform,
             mask_transform=winclip_mask_transform,
         )
-        datamodule = VisADataModule(
+        datamodule = create_datamodule(
+            args.dataset,
             dataset_root=args.dataset_root,
             category=args.category,
             image_size=winclip_image_size,
@@ -475,7 +486,8 @@ def main() -> None:
             eval_transform=dictas_transform,
             mask_transform=dictas_mask_transform,
         )
-        datamodule = VisADataModule(
+        datamodule = create_datamodule(
+            args.dataset,
             dataset_root=args.dataset_root,
             category=args.category,
             image_size=dictas_image_size,
@@ -510,7 +522,8 @@ def main() -> None:
             eval_transform=subspacead_transform,
             mask_transform=subspacead_mask_transform,
         )
-        datamodule = VisADataModule(
+        datamodule = create_datamodule(
+            args.dataset,
             dataset_root=args.dataset_root,
             category=args.category,
             image_size=subspacead_resolution,
@@ -538,7 +551,8 @@ def main() -> None:
             eval_transform=tipsv2_transform,
             mask_transform=tipsv2_mask_transform,
         )
-        datamodule = VisADataModule(
+        datamodule = create_datamodule(
+            args.dataset,
             dataset_root=args.dataset_root,
             category=args.category,
             image_size=args.smaller_edge_size,
