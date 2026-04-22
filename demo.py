@@ -42,6 +42,71 @@ from lib.lightning import (
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+# Method key → module class (for checkpoint loading)
+_MODULE_CLS: dict[str, type] = {
+    "patchcore": PatchCoreModule,
+    "anomalydino": AnomalyDINOModule,
+    "anomalytipsv2": AnomalyTIPSv2Module,
+    "dictas": DictASModule,
+    "subspacead": SubspaceADModule,
+}
+
+_CHECKPOINT_ROOT = Path("checkpoints")
+_NO_CHECKPOINT = "(none — fit on-the-fly)"
+
+
+def discover_checkpoints(method_key: str | None = None) -> list[tuple[str, str]]:
+    """Scan checkpoints/ and return available (label, path) pairs.
+
+    If *method_key* is given, only return checkpoints for that method.
+    Returns a list of ``(display_label, checkpoint_dir_path)`` tuples
+    sorted newest-first.
+    """
+    results: list[tuple[str, str]] = []
+    if not _CHECKPOINT_ROOT.exists():
+        return results
+
+    method_dirs = (
+        [_CHECKPOINT_ROOT / method_key]
+        if method_key
+        else [d for d in _CHECKPOINT_ROOT.iterdir() if d.is_dir()]
+    )
+
+    for method_dir in method_dirs:
+        if not method_dir.exists():
+            continue
+        mkey = method_dir.name
+        if mkey not in _MODULE_CLS:
+            continue
+        for cat_dir in sorted(method_dir.iterdir()):
+            if not cat_dir.is_dir():
+                continue
+            for ts_dir in sorted(cat_dir.iterdir(), reverse=True):
+                if not ts_dir.is_dir():
+                    continue
+                if (ts_dir / "model.ckpt").exists():
+                    label = f"{mkey} / {cat_dir.name} / {ts_dir.name}"
+                    results.append((label, str(ts_dir)))
+    return results
+
+
+def _checkpoint_choices(method_key: str) -> list[str]:
+    """Return dropdown choices for a given method: [(label, path), ...]."""
+    ckpts = discover_checkpoints(method_key)
+    choices = [_NO_CHECKPOINT]
+    choices.extend(lbl for lbl, _ in ckpts)
+    return choices
+
+
+def _checkpoint_path_for_label(label: str, method_key: str) -> str | None:
+    """Resolve a display label back to its checkpoint directory path."""
+    if label == _NO_CHECKPOINT or not label:
+        return None
+    for lbl, path in discover_checkpoints(method_key):
+        if lbl == label:
+            return path
+    return None
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  Method registry
@@ -514,6 +579,7 @@ def run_inference(
     nominal_gallery,
     method_key: str,
     threshold: float,
+    checkpoint_label: str,
     # PatchCore
     coreset_ratio: float,
     num_neighbors: int,
@@ -541,72 +607,90 @@ def run_inference(
                 item = item[0]
             nominal_imgs.append(_to_rgb_np(item))
 
-    if spec.needs_nominal and not nominal_imgs:
-        raise gr.Error(
-            f"{spec.label} requires at least one nominal (defect-free) reference image."
-        )
+    # ── Try loading from checkpoint ───────────────────────────────
+    ckpt_path = _checkpoint_path_for_label(checkpoint_label or "", method_key)
+    use_checkpoint = ckpt_path is not None and method_key in _MODULE_CLS
 
-    progress(0.05, desc="Building model")
-    t0 = time.perf_counter()
-
-    if method_key == "patchcore":
-        module = build_patchcore(
-            {"coreset_sampling_ratio": coreset_ratio, "num_neighbors": num_neighbors}
-        )
-    elif method_key == "anomalydino":
-        module = build_anomalydino(
-            {
-                "dino_model": dino_model,
-                "masking": adino_masking,
-                "rotation": adino_rotation,
-                "top_percent": adino_top_percent,
-            }
-        )
-    elif method_key == "anomalytipsv2":
-        module = build_anomalytipsv2(
-            {
-                "tips_model": tips_model,
-                "masking": adino_masking,
-                "rotation": adino_rotation,
-                "top_percent": adino_top_percent,
-            }
-        )
-    elif method_key == "winclip":
-        module = build_winclip(
-            {
-                "category": category or "object",
-                "k_shot": k_shot if nominal_imgs else 0,
-            }
-        )
-    elif method_key == "dictas":
-        module = build_dictas(
-            {
-                "category": category or "object",
-                "k_shot": max(1, int(k_shot)) if nominal_imgs else 1,
-            }
-        )
-    elif method_key == "subspacead":
-        module = build_subspacead({})
+    if use_checkpoint:
+        progress(0.05, desc="Loading checkpoint")
+        t0 = time.perf_counter()
+        cls = _MODULE_CLS[method_key]
+        module = cls.load_checkpoint(ckpt_path, map_location="cpu")
+        module.to(DEVICE).eval()
+        t_build = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        t_fit = time.perf_counter() - t1  # no fitting needed
     else:
-        raise gr.Error(f"Unknown method: {method_key}")
+        # ── Build + fit on-the-fly (original path) ────────────────
+        if spec.needs_nominal and not nominal_imgs:
+            raise gr.Error(
+                f"{spec.label} requires at least one nominal (defect-free) reference image."
+            )
 
-    t_build = time.perf_counter() - t0
-    progress(0.3, desc="Fitting reference features")
+        progress(0.05, desc="Building model")
+        t0 = time.perf_counter()
 
-    t1 = time.perf_counter()
-    if method_key == "patchcore":
-        _fit_patchcore(module, nominal_imgs)
-    elif method_key == "anomalydino":
-        _fit_anomalydino(module, nominal_imgs)
-    elif method_key == "anomalytipsv2":
-        _fit_anomalytipsv2(module, nominal_imgs)
-    elif method_key == "winclip":
-        _fit_winclip(module, nominal_imgs, category or "object")
-    elif method_key == "dictas":
-        _fit_dictas(module, nominal_imgs, category or "object")
-    elif method_key == "subspacead":
-        _fit_subspacead(module, nominal_imgs)
-    t_fit = time.perf_counter() - t1
+        if method_key == "patchcore":
+            module = build_patchcore(
+                {
+                    "coreset_sampling_ratio": coreset_ratio,
+                    "num_neighbors": num_neighbors,
+                }
+            )
+        elif method_key == "anomalydino":
+            module = build_anomalydino(
+                {
+                    "dino_model": dino_model,
+                    "masking": adino_masking,
+                    "rotation": adino_rotation,
+                    "top_percent": adino_top_percent,
+                }
+            )
+        elif method_key == "anomalytipsv2":
+            module = build_anomalytipsv2(
+                {
+                    "tips_model": tips_model,
+                    "masking": adino_masking,
+                    "rotation": adino_rotation,
+                    "top_percent": adino_top_percent,
+                }
+            )
+        elif method_key == "winclip":
+            module = build_winclip(
+                {
+                    "category": category or "object",
+                    "k_shot": k_shot if nominal_imgs else 0,
+                }
+            )
+        elif method_key == "dictas":
+            module = build_dictas(
+                {
+                    "category": category or "object",
+                    "k_shot": max(1, int(k_shot)) if nominal_imgs else 1,
+                }
+            )
+        elif method_key == "subspacead":
+            module = build_subspacead({})
+        else:
+            raise gr.Error(f"Unknown method: {method_key}")
+
+        t_build = time.perf_counter() - t0
+        progress(0.3, desc="Fitting reference features")
+
+        t1 = time.perf_counter()
+        if method_key == "patchcore":
+            _fit_patchcore(module, nominal_imgs)
+        elif method_key == "anomalydino":
+            _fit_anomalydino(module, nominal_imgs)
+        elif method_key == "anomalytipsv2":
+            _fit_anomalytipsv2(module, nominal_imgs)
+        elif method_key == "winclip":
+            _fit_winclip(module, nominal_imgs, category or "object")
+        elif method_key == "dictas":
+            _fit_dictas(module, nominal_imgs, category or "object")
+        elif method_key == "subspacead":
+            _fit_subspacead(module, nominal_imgs)
+        t_fit = time.perf_counter() - t1
 
     progress(0.75, desc="Running inference")
     t2 = time.perf_counter()
@@ -672,8 +756,13 @@ def run_inference(
     </div>
     """
 
+    ckpt_info = (
+        f"  ckpt={Path(ckpt_path).name}"
+        if use_checkpoint
+        else "  refs=" + str(len(nominal_imgs))
+    )
     log_text = (
-        f"[{spec.label}] refs={len(nominal_imgs)}  "
+        f"[{spec.label}]{ckpt_info}  "
         f"score={score:.4f}  top1%={stats['mean_top1']:.3f}  "
         f"verdict={verdict} ({confidence * 100:.1f}%)  "
         f"t_build={t_build:.2f}s  t_fit={t_fit:.2f}s  t_pred={t_pred:.2f}s"
@@ -1518,6 +1607,8 @@ def _on_method_change(method_key: str):
         if spec.needs_nominal
         else "NOMINAL REFERENCES  ▸  OPTIONAL"
     )
+    ckpt_choices = _checkpoint_choices(method_key)
+    has_checkpoints = len(ckpt_choices) > 1  # more than just the "(none)" entry
     return (
         gr.update(value=_method_info_html(method_key)),
         gr.update(label=gallery_label),
@@ -1526,6 +1617,11 @@ def _on_method_change(method_key: str):
         gr.update(visible=method_key == "anomalytipsv2"),
         gr.update(visible=method_key in {"winclip", "dictas"}),
         gr.update(visible=method_key in {"anomalydino", "anomalytipsv2"}),
+        gr.update(
+            choices=ckpt_choices,
+            value=_NO_CHECKPOINT,
+            visible=has_checkpoints,
+        ),
     )
 
 
@@ -1578,6 +1674,17 @@ def build_ui() -> gr.Blocks:
                     step=0.01,
                     value=0.35,
                     elem_classes=["iad-slider"],
+                )
+
+                # ── Checkpoint selector ────────────────────────────
+                _init_choices = _checkpoint_choices("anomalydino")
+                checkpoint_dropdown = gr.Dropdown(
+                    label="LOAD TRAINED CHECKPOINT",
+                    choices=_init_choices,
+                    value=_NO_CHECKPOINT,
+                    interactive=True,
+                    visible=len(_init_choices) > 1,
+                    info="Skip on-the-fly fitting by loading a pre-trained model.",
                 )
 
                 # ── Advanced parameters ────────────────────────────
@@ -1741,6 +1848,7 @@ def build_ui() -> gr.Blocks:
                 grp_tips,
                 grp_winclip,
                 grp_shared_dino,
+                checkpoint_dropdown,
             ],
         )
 
@@ -1751,6 +1859,7 @@ def build_ui() -> gr.Blocks:
                 nominal_gallery,
                 method_dropdown,
                 threshold,
+                checkpoint_dropdown,
                 coreset_ratio,
                 num_neighbors,
                 dino_model,
