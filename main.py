@@ -622,21 +622,21 @@ def main() -> None:
         datamodule.setup("fit")
         trainer.fit(model, datamodule.train_dataloader(), datamodule.val_dataloader())
 
+        ckpt_dir = make_checkpoint_dir("checkpoints", args.model, args.category)
+        model.save_checkpoint(ckpt_dir)
+        save_metadata(
+            ckpt_dir,
+            model_name=args.model,
+            category=args.category,
+            extra={k: str(v) for k, v in vars(args).items()},
+        )
+
         datamodule.setup("test")
         trainer.test(model, datamodule.test_dataloader())
     finally:
         emissions = emissions_tracker.stop()
         if emissions is not None:
             mlflow_logger.log_metrics({"carbon/emissions_kg": emissions})
-
-    ckpt_dir = make_checkpoint_dir("checkpoints", args.model, args.category)
-    model.save_checkpoint(ckpt_dir)
-    save_metadata(
-        ckpt_dir,
-        model_name=args.model,
-        category=args.category,
-        extra={k: str(v) for k, v in vars(args).items()},
-    )
 
     print(f"\n✓ Training complete for category '{args.category}'.")
     print(f"  Checkpoint saved to: {ckpt_dir.resolve()}")

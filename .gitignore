@@ -18,6 +18,7 @@ wheels/
 .vscode/
 .clinerules
 outputs/
+.DS_Store
 
 # Data
 /data/
