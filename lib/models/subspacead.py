@@ -299,7 +299,10 @@ class SubspaceAD(nn.Module):
         cov /= total_tokens - 1
 
         # ── Eigendecomposition ───────────────────────────────────────
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        # eigh is not implemented on MPS; run on CPU (cov is small: D×D).
+        cov_cpu = cov.to("cpu", dtype=torch.float64)
+        del cov
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_cpu)
         # Sort descending.
         idx = torch.argsort(eigenvalues, descending=True)
         eigenvalues = eigenvalues[idx]
@@ -310,9 +313,7 @@ class SubspaceAD(nn.Module):
         r = int(
             torch.searchsorted(
                 cumvar,
-                torch.tensor(
-                    [self.pca_variance_threshold], dtype=compute_dtype, device=device
-                ),
+                torch.tensor([self.pca_variance_threshold], dtype=torch.float64),
             ).item()
             + 1
         )
