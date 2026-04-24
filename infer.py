@@ -111,6 +111,14 @@ def parse_args() -> argparse.Namespace:
         help="EUPE ONNX backbone variant (default: eupe_vitb16).",
     )
 
+    # SubspaceAD-specific
+    parser.add_argument(
+        "--subspacead_resolution",
+        type=int,
+        default=672,
+        help="Input resolution for SubspaceAD (default 672).",
+    )
+
     # Checkpoint
     parser.add_argument(
         "--checkpoint_dir",
@@ -375,7 +383,7 @@ def main() -> None:
             mask_transform=get_mask_transforms(image_size),
         )
     elif args.model == "subspacead":
-        image_size = 672
+        image_size = args.subspacead_resolution
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),
             eval_transform=get_eval_transforms(image_size),

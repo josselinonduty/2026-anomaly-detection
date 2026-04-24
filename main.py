@@ -155,6 +155,18 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Number of random rotations per normal image (SubspaceAD, default 30).",
     )
+    parser.add_argument(
+        "--subspacead_gaussian_sigma",
+        type=float,
+        default=4.0,
+        help="Gaussian sigma for anomaly map smoothing (SubspaceAD, default 4.0).",
+    )
+    parser.add_argument(
+        "--subspacead_top_percent",
+        type=float,
+        default=0.01,
+        help="Top patch fraction for image-level scoring (SubspaceAD, default 0.01).",
+    )
 
     # AnomalyEUPE-specific
     parser.add_argument(
@@ -613,6 +625,8 @@ def train_single(
             layers=tuple(args.subspacead_layers) if args.subspacead_layers else None,
             pca_variance_threshold=args.subspacead_pca_ev,
             aug_count=args.subspacead_aug_count,
+            gaussian_sigma=args.subspacead_gaussian_sigma,
+            top_percent=args.subspacead_top_percent,
             image_size=subspacead_resolution,
         )
         args.max_epochs = 1

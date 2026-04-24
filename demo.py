@@ -462,6 +462,8 @@ def build_subspacead(params: dict) -> SubspaceADModule:
         image_resolution=METHODS["subspacead"].image_size,
         aug_count=int(params.get("subspacead_aug_count", 30)),
         pca_variance_threshold=float(params.get("subspacead_pca_ev", 0.99)),
+        gaussian_sigma=float(params.get("subspacead_gaussian_sigma", 4.0)),
+        top_percent=float(params.get("subspacead_top_percent", 0.01)),
         image_size=METHODS["subspacead"].image_size,
     )
 
@@ -661,6 +663,12 @@ def run_inference(
     # WinCLIP
     category: str,
     k_shot: int,
+    # SubspaceAD
+    subspacead_backbone: str,
+    subspacead_aug_count: int,
+    subspacead_pca_ev: float,
+    subspacead_gaussian_sigma: float,
+    subspacead_top_percent: float,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
 ):
     if test_image is None:
@@ -747,7 +755,13 @@ def run_inference(
                 }
             )
         elif method_key == "subspacead":
-            module = build_subspacead({})
+            module = build_subspacead({
+                "subspacead_backbone": subspacead_backbone,
+                "subspacead_aug_count": subspacead_aug_count,
+                "subspacead_pca_ev": subspacead_pca_ev,
+                "subspacead_gaussian_sigma": subspacead_gaussian_sigma,
+                "subspacead_top_percent": subspacead_top_percent,
+            })
         elif method_key == "feature_match":
             module = build_feature_match({})
         else:
@@ -1700,6 +1714,7 @@ def _on_method_change(method_key: str):
         gr.update(visible=method_key == "anomalytipsv2"),
         gr.update(visible=method_key == "anomalyeupe"),
         gr.update(visible=method_key in {"winclip", "dictas"}),
+        gr.update(visible=method_key == "subspacead"),
         gr.update(
             visible=method_key in {"anomalydino", "anomalytipsv2", "anomalyeupe"}
         ),
@@ -1869,6 +1884,54 @@ def build_ui() -> gr.Blocks:
                             elem_classes=["iad-slider"],
                         )
 
+                    # SubspaceAD-specific
+                    with gr.Group(
+                        visible=False, elem_classes=["iad-group"]
+                    ) as grp_subspacead:
+                        gr.Markdown("**SubspaceAD**")
+                        subspacead_backbone = gr.Dropdown(
+                            label="BACKBONE",
+                            choices=[
+                                "dinov2_vits14",
+                                "dinov2_vitb14",
+                                "dinov2_vitl14",
+                                "dinov2_vitg14",
+                            ],
+                            value="dinov2_vitg14",
+                        )
+                        subspacead_aug_count = gr.Slider(
+                            label="AUGMENTATION COUNT",
+                            minimum=1,
+                            maximum=60,
+                            step=1,
+                            value=30,
+                            elem_classes=["iad-slider"],
+                        )
+                        subspacead_pca_ev = gr.Slider(
+                            label="PCA VARIANCE THRESHOLD (τ)",
+                            minimum=0.8,
+                            maximum=1.0,
+                            step=0.01,
+                            value=0.99,
+                            elem_classes=["iad-slider"],
+                        )
+                        subspacead_gaussian_sigma = gr.Slider(
+                            label="GAUSSIAN SIGMA",
+                            minimum=0.0,
+                            maximum=16.0,
+                            step=0.5,
+                            value=4.0,
+                            elem_classes=["iad-slider"],
+                        )
+                        subspacead_top_percent = gr.Slider(
+                            label="TOP PERCENT (TVaR)",
+                            minimum=0.001,
+                            maximum=0.1,
+                            step=0.001,
+                            value=0.01,
+                            elem_classes=["iad-slider"],
+                        )
+
                     # WinCLIP-specific
                     with gr.Group(
                         visible=False, elem_classes=["iad-group"]
@@ -1952,6 +2015,7 @@ def build_ui() -> gr.Blocks:
                 grp_tips,
                 grp_eupe,
                 grp_winclip,
+                grp_subspacead,
                 grp_shared_dino,
                 checkpoint_dropdown,
             ],
@@ -1975,6 +2039,11 @@ def build_ui() -> gr.Blocks:
                 eupe_model,
                 category,
                 k_shot,
+                subspacead_backbone,
+                subspacead_aug_count,
+                subspacead_pca_ev,
+                subspacead_gaussian_sigma,
+                subspacead_top_percent,
             ],
             outputs=[verdict_html, metrics_html, overlay_img, heatmap_img, log_box],
         )

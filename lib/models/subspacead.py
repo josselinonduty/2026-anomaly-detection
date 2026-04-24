@@ -250,18 +250,22 @@ class SubspaceAD(nn.Module):
             else:
                 raw_images.append(img)
 
-        # ── Single pass: extract features from each view lazily ──────
-        # Generate augmented views one at a time, run the backbone once,
-        # keep only the small feature vectors (not the full images).
+        # ── Batched feature extraction ────────────────────────────────
+        # Batch augmented views to reduce backbone forward-pass overhead.
+        batch_size = 8  # tune based on GPU memory
         all_features: list[np.ndarray] = []  # list of (N_patches, D) arrays
         for raw in raw_images:
             variants = self.augment_reference(raw, rng)
-            for variant in variants:
-                img_tensor, _ = self.prepare_image(variant)
-                feats = self.extract_features(img_tensor)  # (1, N, D)
-                all_features.append(feats.reshape(-1, feats.shape[-1]))
-            # Free the augmented views immediately.
+            # Preprocess all views into tensors.
+            tensors = [self.prepare_image(v)[0] for v in variants]
             del variants
+            # Run in mini-batches.
+            for i in range(0, len(tensors), batch_size):
+                batch = torch.stack(tensors[i : i + batch_size])  # (B, C, H, W)
+                feats = self.extract_features(batch)  # (B, N, D)
+                for j in range(feats.shape[0]):
+                    all_features.append(feats[j])  # (N, D)
+            del tensors
 
         feature_dim = all_features[0].shape[-1]
 
