@@ -271,7 +271,10 @@ class SubspaceAD(nn.Module):
         all_feats_np = np.concatenate(all_features, axis=0)  # (total_tokens, D)
         del all_features  # free the list of small arrays
 
-        all_feats_gpu = torch.from_numpy(all_feats_np).to(device, dtype=torch.float64)
+        # MPS does not support float64; use float32 there, float64 elsewhere.
+        compute_dtype = torch.float32 if device.type == "mps" else torch.float64
+
+        all_feats_gpu = torch.from_numpy(all_feats_np).to(device, dtype=compute_dtype)
         del all_feats_np  # free the numpy copy
 
         total_tokens = all_feats_gpu.shape[0]
@@ -285,7 +288,7 @@ class SubspaceAD(nn.Module):
 
         # Chunked matmul to limit peak memory: C^T @ C in blocks.
         cov = torch.zeros(
-            (feature_dim, feature_dim), dtype=torch.float64, device=device
+            (feature_dim, feature_dim), dtype=compute_dtype, device=device
         )
         chunk_size = 4096
         for i in range(0, total_tokens, chunk_size):
@@ -308,7 +311,7 @@ class SubspaceAD(nn.Module):
             torch.searchsorted(
                 cumvar,
                 torch.tensor(
-                    [self.pca_variance_threshold], dtype=torch.float64, device=device
+                    [self.pca_variance_threshold], dtype=compute_dtype, device=device
                 ),
             ).item()
             + 1
