@@ -30,11 +30,13 @@ from lib.data import (
 from lib.data.transforms import get_eval_transforms, get_mask_transforms
 from lib.lightning import (
     AnomalyDINOModule,
+    AnomalyEUPEModule,
     AnomalyTIPSv2Module,
     AutoencoderModule,
     DictASModule,
     DinomalyModule,
     EfficientAdModule,
+    FeatureMatchModule,
     PatchCoreModule,
     SubspaceADModule,
     WinCLIPModule,
@@ -51,10 +53,12 @@ _LOADER_MAP = {
     "dinomaly": DinomalyModule,
     "efficientad": EfficientAdModule,
     "anomalydino": AnomalyDINOModule,
+    "anomalyeupe": AnomalyEUPEModule,
     "anomalytipsv2": AnomalyTIPSv2Module,
     "winclip": WinCLIPModule,
     "dictas": DictASModule,
     "subspacead": SubspaceADModule,
+    "feature_match": FeatureMatchModule,
 }
 
 
@@ -86,12 +90,30 @@ def parse_args() -> argparse.Namespace:
             "dinomaly",
             "efficientad",
             "anomalydino",
+            "anomalyeupe",
             "anomalytipsv2",
             "winclip",
             "dictas",
             "subspacead",
+            "feature_match",
         ],
         help="Model architecture to use.",
+    )
+
+    # Checkpoint
+    parser.add_argument(
+        "--eupe_model_name",
+        type=str,
+        default="eupe_vitb16",
+        choices=[
+            "eupe_vitt16",
+            "eupe_vitt16_int8",
+            "eupe_vits16",
+            "eupe_vits16_int8",
+            "eupe_vitb16",
+            "eupe_vitb16_int8",
+        ],
+        help="EUPE ONNX backbone variant (default: eupe_vitb16).",
     )
 
     # Checkpoint
@@ -180,6 +202,15 @@ def _predict_anomalydino(
 
 
 @torch.no_grad()
+def _predict_anomalyeupe(
+    model: AnomalyEUPEModule, images: torch.Tensor
+) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model(images)
+    return anomaly_maps[:, 0]
+
+
+@torch.no_grad()
 def _predict_anomalytipsv2(
     model: AnomalyTIPSv2Module, images: torch.Tensor
 ) -> torch.Tensor:
@@ -218,16 +249,26 @@ def _predict_subspacead(model: SubspaceADModule, images: torch.Tensor) -> torch.
     return anomaly_maps[:, 0]
 
 
+def _predict_feature_match(
+    model: FeatureMatchModule, images: torch.Tensor
+) -> torch.Tensor:
+    """Return (B, H, W) anomaly maps."""
+    _, anomaly_maps = model.model.predict(images)
+    return anomaly_maps
+
+
 _PREDICT_FN = {
     "autoencoder": _predict_autoencoder,
     "patchcore": _predict_patchcore,
     "dinomaly": _predict_dinomaly,
     "efficientad": _predict_efficientad,
     "anomalydino": _predict_anomalydino,
+    "anomalyeupe": _predict_anomalyeupe,
     "anomalytipsv2": _predict_anomalytipsv2,
     "winclip": _predict_winclip,
     "dictas": _predict_dictas,
     "subspacead": _predict_subspacead,
+    "feature_match": _predict_feature_match,
 }
 
 
@@ -324,6 +365,13 @@ def main() -> None:
         image_size = 392
     elif args.model == "anomalydino":
         image_size = 448
+        extra_dm_kwargs.update(
+            train_transform=get_eval_transforms(image_size),
+            eval_transform=get_eval_transforms(image_size),
+            mask_transform=get_mask_transforms(image_size),
+        )
+    elif args.model == "anomalyeupe":
+        image_size = 224
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),
             eval_transform=get_eval_transforms(image_size),

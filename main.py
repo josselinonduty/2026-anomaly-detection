@@ -30,11 +30,13 @@ from lib.data import (
 )
 from lib.lightning import (
     AnomalyDINOModule,
+    AnomalyEUPEModule,
     AnomalyTIPSv2Module,
     AutoencoderModule,
     DictASModule,
     DinomalyModule,
     EfficientAdModule,
+    FeatureMatchModule,
     PatchCoreModule,
     SubspaceADModule,
     WinCLIPModule,
@@ -71,10 +73,12 @@ def parse_args() -> argparse.Namespace:
             "dinomaly",
             "efficientad",
             "anomalydino",
+            "anomalyeupe",
             "anomalytipsv2",
             "winclip",
             "dictas",
             "subspacead",
+            "feature_match",
         ],
         help="Model architecture to use.",
     )
@@ -169,6 +173,28 @@ def parse_args() -> argparse.Namespace:
         help="Number of random rotations per normal image (SubspaceAD, default 30).",
     )
 
+    # AnomalyEUPE-specific
+    parser.add_argument(
+        "--eupe_model_name",
+        type=str,
+        default="eupe_vitb16",
+        choices=[
+            "eupe_vitt16",
+            "eupe_vitt16_int8",
+            "eupe_vits16",
+            "eupe_vits16_int8",
+            "eupe_vitb16",
+            "eupe_vitb16_int8",
+        ],
+        help="EUPE ONNX backbone variant (default: eupe_vitb16). Append _int8 for quantised.",
+    )
+    parser.add_argument(
+        "--eupe_global_weight",
+        type=float,
+        default=0.3,
+        help="Weight of global (CLS) score vs local (patch) score (default 0.3).",
+    )
+
     # AnomalyDINO-specific
     parser.add_argument(
         "--dino_model",
@@ -251,6 +277,34 @@ def parse_args() -> argparse.Namespace:
             "google/tipsv2-g14",
         ],
         help="TIPSv2 backbone for AnomalyTIPSv2.",
+    )
+
+    # FeatureMatch-specific
+    parser.add_argument(
+        "--fm_descriptor",
+        type=str,
+        default="sift",
+        choices=["sift", "orb"],
+        help="OpenCV descriptor for FeatureMatch (default sift).",
+    )
+    parser.add_argument(
+        "--fm_map_mode",
+        type=str,
+        default="dense",
+        choices=["dense", "ssim"],
+        help="Anomaly map: 'dense' (abs diff) or 'ssim' (1-SSIM).",
+    )
+    parser.add_argument(
+        "--fm_ratio_thresh",
+        type=float,
+        default=0.75,
+        help="Lowe's ratio test threshold (FeatureMatch).",
+    )
+    parser.add_argument(
+        "--fm_blur_sigma",
+        type=float,
+        default=7.0,
+        help="Gaussian sigma for difference map smoothing (FeatureMatch).",
     )
 
     # DictAS-specific
@@ -364,10 +418,12 @@ def main() -> None:
         | EfficientAdModule
         | AutoencoderModule
         | AnomalyDINOModule
+        | AnomalyEUPEModule
         | AnomalyTIPSv2Module
         | WinCLIPModule
         | DictASModule
         | SubspaceADModule
+        | FeatureMatchModule
     )
     if args.model == "patchcore":
         model = PatchCoreModule(
@@ -442,6 +498,35 @@ def main() -> None:
             masking=not args.no_masking,
             rotation=not args.no_rotation,
             image_size=args.image_size,
+        )
+        args.max_epochs = 1
+    elif args.model == "anomalyeupe":
+        from lib.data.transforms import get_eval_transforms, get_mask_transforms
+
+        eupe_image_size = 224
+        eupe_transform = get_eval_transforms(eupe_image_size)
+        eupe_mask_transform = get_mask_transforms(eupe_image_size)
+        extra_dm_kwargs.update(
+            train_transform=eupe_transform,
+            eval_transform=eupe_transform,
+            mask_transform=eupe_mask_transform,
+        )
+        datamodule = create_datamodule(
+            args.dataset,
+            dataset_root=args.dataset_root,
+            category=args.category,
+            image_size=eupe_image_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            **extra_dm_kwargs,
+        )
+        args.image_size = eupe_image_size
+        model = AnomalyEUPEModule(
+            model_name=args.eupe_model_name,
+            masking=not args.no_masking,
+            rotation=not args.no_rotation,
+            global_weight=args.eupe_global_weight,
+            image_size=eupe_image_size,
         )
         args.max_epochs = 1
     elif args.model == "winclip":
@@ -569,6 +654,15 @@ def main() -> None:
             image_size=args.image_size,
         )
         args.max_epochs = 1
+    elif args.model == "feature_match":
+        model = FeatureMatchModule(
+            descriptor=args.fm_descriptor,
+            image_size=args.image_size,
+            map_mode=args.fm_map_mode,
+            ratio_thresh=args.fm_ratio_thresh,
+            blur_sigma=args.fm_blur_sigma,
+        )
+        args.max_epochs = 1
     else:
         msg = f"Unknown model: {args.model!r}"
         raise ValueError(msg)
@@ -595,6 +689,7 @@ def main() -> None:
     )
 
     if use_xpu:
+        print("Using XPU accelerator")
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
             accelerator=XPUAccelerator(),

@@ -31,8 +31,10 @@ matplotlib.use("Agg")
 # ── Model imports (lazy in UI, but modules are cheap to import) ─────
 from lib.lightning import (
     AnomalyDINOModule,
+    AnomalyEUPEModule,
     AnomalyTIPSv2Module,
     DictASModule,
+    FeatureMatchModule,
     PatchCoreModule,
     SubspaceADModule,
     WinCLIPModule,
@@ -46,9 +48,11 @@ _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _MODULE_CLS: dict[str, type] = {
     "patchcore": PatchCoreModule,
     "anomalydino": AnomalyDINOModule,
+    "anomalyeupe": AnomalyEUPEModule,
     "anomalytipsv2": AnomalyTIPSv2Module,
     "dictas": DictASModule,
     "subspacead": SubspaceADModule,
+    "feature_match": FeatureMatchModule,
 }
 
 _CHECKPOINT_ROOT = Path("checkpoints")
@@ -157,6 +161,17 @@ METHODS: dict[str, MethodSpec] = {
         image_size=448,
         notes="AnomalyDINO pipeline with a TIPSv2 backbone (stronger features).",
     ),
+    "anomalyeupe": MethodSpec(
+        key="anomalyeupe",
+        label="AnomalyEUPE",
+        tagline="Meta EUPE ONNX • dual CLS + patch scoring",
+        needs_nominal=True,
+        supports_nominal=True,
+        supports_zero_shot=False,
+        image_size=224,
+        notes="Dual-level anomaly detection with EUPE ONNX backbone: "
+        "global CLS distance + local patch NN distance (arXiv:2603.22387).",
+    ),
     "winclip": MethodSpec(
         key="winclip",
         label="WinCLIP / WinCLIP+",
@@ -188,6 +203,18 @@ METHODS: dict[str, MethodSpec] = {
         image_size=672,
         notes="Training-free PCA subspace modeling on DINOv2-G features. "
         "CVPR 2026 (arXiv:2602.23013). Few-shot SOTA on MVTec-AD and VisA.",
+    ),
+    "feature_match": MethodSpec(
+        key="feature_match",
+        label="FeatureMatch",
+        tagline="OpenCV SIFT/ORB • classical feature matching",
+        needs_nominal=True,
+        supports_nominal=True,
+        supports_zero_shot=False,
+        image_size=256,
+        notes="Pure classical CV: builds a descriptor DB from normal images, "
+        "scores test images via Lowe's ratio test on SIFT or ORB features. "
+        "No deep learning.",
     ),
 }
 
@@ -288,6 +315,18 @@ def build_anomalytipsv2(params: dict) -> AnomalyTIPSv2Module:
     )
 
 
+def build_anomalyeupe(params: dict) -> AnomalyEUPEModule:
+    return AnomalyEUPEModule(
+        model_name=str(params.get("eupe_model_name", "eupe_vitb16")),
+        masking=bool(params.get("masking", True)),
+        rotation=bool(params.get("rotation", True)),
+        top_percent=float(params.get("top_percent", 0.01)),
+        gaussian_sigma=float(params.get("gaussian_sigma", 4.0)),
+        global_weight=float(params.get("global_weight", 0.3)),
+        image_size=METHODS["anomalyeupe"].image_size,
+    )
+
+
 def build_winclip(params: dict) -> WinCLIPModule:
     return WinCLIPModule(
         category=params.get("category", "object"),
@@ -385,6 +424,11 @@ def _fit_anomalytipsv2(module: AnomalyTIPSv2Module, nominals: list[np.ndarray]) 
     module.model._fitted = True
 
 
+def _fit_anomalyeupe(module: AnomalyEUPEModule, nominals: list[np.ndarray]) -> None:
+    module.to(DEVICE).eval()
+    module.model.fit(nominals)  # nominals: list[np.ndarray uint8 HWC]
+
+
 def _fit_winclip(
     module: WinCLIPModule, nominals: list[np.ndarray], category: str
 ) -> None:
@@ -422,8 +466,22 @@ def build_subspacead(params: dict) -> SubspaceADModule:
     )
 
 
+def build_feature_match(params: dict) -> FeatureMatchModule:
+    return FeatureMatchModule(
+        descriptor=params.get("fm_descriptor", "sift"),
+        image_size=METHODS["feature_match"].image_size,
+        map_mode=params.get("fm_map_mode", "dense"),
+        ratio_thresh=float(params.get("fm_ratio_thresh", 0.75)),
+        blur_sigma=float(params.get("fm_blur_sigma", 7.0)),
+    )
+
+
 def _fit_subspacead(module: SubspaceADModule, nominals: list[np.ndarray]) -> None:
     module.to(DEVICE).eval()
+    module.model.fit(nominals)
+
+
+def _fit_feature_match(module: FeatureMatchModule, nominals: list[np.ndarray]) -> None:
     module.model.fit(nominals)
 
 
@@ -448,6 +506,10 @@ def _predict_module(
         return float(scores[0].cpu()), maps[0].cpu().numpy()
 
     if method_key == "anomalydino":
+        scores, maps = module.model.predict_batch_tensor(x, output_size=(size, size))
+        return float(scores[0].cpu()), maps[0, 0].cpu().numpy()
+
+    if method_key == "anomalyeupe":
         scores, maps = module.model.predict_batch_tensor(x, output_size=(size, size))
         return float(scores[0].cpu()), maps[0, 0].cpu().numpy()
 
@@ -476,6 +538,10 @@ def _predict_module(
     if method_key == "subspacead":
         scores, maps = module.model.predict_batch_tensor(x, output_size=(size, size))
         return float(scores[0].cpu()), maps[0, 0].cpu().numpy()
+
+    if method_key == "feature_match":
+        scores, maps = module.model.predict(x)
+        return float(scores[0].cpu()), maps[0].cpu().numpy()
 
     raise ValueError(f"Unknown method: {method_key}")
 
@@ -590,6 +656,8 @@ def run_inference(
     adino_top_percent: float,
     # AnomalyTIPSv2
     tips_model: str,
+    # AnomalyEUPE
+    eupe_model: str,
     # WinCLIP
     category: str,
     k_shot: int,
@@ -655,6 +723,15 @@ def run_inference(
                     "top_percent": adino_top_percent,
                 }
             )
+        elif method_key == "anomalyeupe":
+            module = build_anomalyeupe(
+                {
+                    "eupe_model_name": eupe_model,
+                    "masking": adino_masking,
+                    "rotation": adino_rotation,
+                    "top_percent": adino_top_percent,
+                }
+            )
         elif method_key == "winclip":
             module = build_winclip(
                 {
@@ -671,6 +748,8 @@ def run_inference(
             )
         elif method_key == "subspacead":
             module = build_subspacead({})
+        elif method_key == "feature_match":
+            module = build_feature_match({})
         else:
             raise gr.Error(f"Unknown method: {method_key}")
 
@@ -684,12 +763,16 @@ def run_inference(
             _fit_anomalydino(module, nominal_imgs)
         elif method_key == "anomalytipsv2":
             _fit_anomalytipsv2(module, nominal_imgs)
+        elif method_key == "anomalyeupe":
+            _fit_anomalyeupe(module, nominal_imgs)
         elif method_key == "winclip":
             _fit_winclip(module, nominal_imgs, category or "object")
         elif method_key == "dictas":
             _fit_dictas(module, nominal_imgs, category or "object")
         elif method_key == "subspacead":
             _fit_subspacead(module, nominal_imgs)
+        elif method_key == "feature_match":
+            _fit_feature_match(module, nominal_imgs)
         t_fit = time.perf_counter() - t1
 
     progress(0.75, desc="Running inference")
@@ -1615,8 +1698,11 @@ def _on_method_change(method_key: str):
         gr.update(visible=method_key == "patchcore"),
         gr.update(visible=method_key == "anomalydino"),
         gr.update(visible=method_key == "anomalytipsv2"),
+        gr.update(visible=method_key == "anomalyeupe"),
         gr.update(visible=method_key in {"winclip", "dictas"}),
-        gr.update(visible=method_key in {"anomalydino", "anomalytipsv2"}),
+        gr.update(
+            visible=method_key in {"anomalydino", "anomalytipsv2", "anomalyeupe"}
+        ),
         gr.update(
             choices=ckpt_choices,
             value=_NO_CHECKPOINT,
@@ -1742,6 +1828,24 @@ def build_ui() -> gr.Blocks:
                             value="google/tipsv2-b14",
                         )
 
+                    # AnomalyEUPE-specific
+                    with gr.Group(
+                        visible=False, elem_classes=["iad-group"]
+                    ) as grp_eupe:
+                        gr.Markdown("**AnomalyEUPE (ONNX)**")
+                        eupe_model = gr.Dropdown(
+                            label="EUPE BACKBONE",
+                            choices=[
+                                "eupe_vitt16",
+                                "eupe_vitt16_int8",
+                                "eupe_vits16",
+                                "eupe_vits16_int8",
+                                "eupe_vitb16",
+                                "eupe_vitb16_int8",
+                            ],
+                            value="eupe_vitb16",
+                        )
+
                     # Shared DINO/TIPS options
                     with gr.Group(
                         visible=True, elem_classes=["iad-group"]
@@ -1846,6 +1950,7 @@ def build_ui() -> gr.Blocks:
                 grp_patchcore,
                 grp_adino,
                 grp_tips,
+                grp_eupe,
                 grp_winclip,
                 grp_shared_dino,
                 checkpoint_dropdown,
@@ -1867,6 +1972,7 @@ def build_ui() -> gr.Blocks:
                 adino_rotation,
                 adino_top_percent,
                 tips_model,
+                eupe_model,
                 category,
                 k_shot,
             ],

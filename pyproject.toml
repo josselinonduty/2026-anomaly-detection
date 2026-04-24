@@ -15,8 +15,11 @@ dependencies = [
     "mlflow>=3.11.1",
     "numpy>=2.4.2",
     "onnx>=1.20.1",
+    "onnxruntime>=1.22.0",
     "onnxscript>=0.6.2",
     "open-clip-torch>=3.3.0",
+    "opencv-contrib-python>=4.13.0.92",
+    "opencv-python>=4.13.0.92",
     "openvino>=2026.0.0",
     "pandas<3",
     "psutil>=7.0.0",
@@ -35,11 +38,12 @@ dependencies = [
 base = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
+    "triton==3.6.0",
 ]
 xpu = [
     "torch>=2.10.0",
     "torchvision>=0.25.0",
-    "triton-xpu>=3.6.0",
+    "triton-xpu==3.6.0",
 ]
 
 [dependency-groups]
