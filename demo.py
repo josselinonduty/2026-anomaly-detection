@@ -1705,6 +1705,18 @@ def _method_info_html(method_key: str) -> str:
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 
+def _discover_image_folders() -> list[str]:
+    """Scan datasets/ for directories containing image files."""
+    if not _DATASETS_ROOT.exists():
+        return []
+    seen: set[str] = set()
+    for p in _DATASETS_ROOT.rglob("*"):
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS:
+            rel = str(p.parent.relative_to(_DATASETS_ROOT))
+            seen.add(rel)
+    return sorted(seen)
+
+
 def _collect_images_in_dir(folder: Path) -> list[Path]:
     """Return sorted image paths inside *folder* (non-recursive)."""
     return sorted(
@@ -1712,19 +1724,16 @@ def _collect_images_in_dir(folder: Path) -> list[Path]:
     )
 
 
-def _preview_server_folder(
-    selected_dirs: list[str] | str | None,
-) -> list[str]:
+def _preview_server_folder(folder_path: str | None) -> list[str]:
     """Return image paths for the Gallery preview from the selected folder."""
-    if not selected_dirs:
-        raise gr.Error("Select a folder from the server browser first.")
-    folder = selected_dirs[0] if isinstance(selected_dirs, list) else selected_dirs
-    full = _DATASETS_ROOT / folder
+    if not folder_path:
+        raise gr.Error("Select a folder first.")
+    full = _DATASETS_ROOT / folder_path
     if not full.is_dir():
-        raise gr.Error(f"Not a valid directory: {folder}")
+        raise gr.Error(f"Not a valid directory: {folder_path}")
     imgs = _collect_images_in_dir(full)
     if not imgs:
-        raise gr.Error(f"No images found in {folder}")
+        raise gr.Error(f"No images found in {folder_path}")
     return [str(p) for p in imgs]
 
 
@@ -1746,16 +1755,15 @@ def _load_server_test_image(
 
 
 def _load_server_nominals(
-    selected_dirs: list[str] | str | None,
+    folder_path: str | None,
     current_gallery: list | None,
 ) -> list:
     """Append all images from the selected server folder to the nominal gallery."""
-    if not selected_dirs:
-        raise gr.Error("Select a folder from the server browser first.")
-    folder = selected_dirs[0] if isinstance(selected_dirs, list) else selected_dirs
-    full = _DATASETS_ROOT / folder
+    if not folder_path:
+        raise gr.Error("Select a folder first.")
+    full = _DATASETS_ROOT / folder_path
     if not full.is_dir():
-        raise gr.Error(f"Not a valid directory: {folder}")
+        raise gr.Error(f"Not a valid directory: {folder_path}")
     imgs = _collect_images_in_dir(full)
     if not imgs:
         raise gr.Error(f"No images found in {folder}")
@@ -1831,15 +1839,13 @@ def build_ui() -> gr.Blocks:
                     "▸ BROWSE SERVER IMAGES", open=False, elem_classes=["iad-accordion"]
                 ):
                     gr.Markdown(
-                        "Navigate to a folder on the server, then preview "
-                        "its images. Click a preview thumbnail to use it as "
-                        "test image, or load the whole folder as references."
+                        "Pick a folder from the server's `datasets/` directory. "
+                        "Click **Preview** to see thumbnails, then click one to "
+                        "use it as test image, or load the whole folder as references."
                     )
-                    server_file_explorer = gr.FileExplorer(
-                        glob="**/",
-                        root_dir=str(_DATASETS_ROOT),
-                        file_count="single",
-                        label="SERVER FOLDERS",
+                    server_folder_dropdown = gr.Dropdown(
+                        label="SERVER FOLDER",
+                        choices=_discover_image_folders(),
                         interactive=True,
                     )
                     server_preview_btn = gr.Button(
@@ -2125,7 +2131,7 @@ def build_ui() -> gr.Blocks:
         # ── Server browser wiring ──────────────────────────────────
         server_preview_btn.click(
             _preview_server_folder,
-            inputs=[server_file_explorer],
+            inputs=[server_folder_dropdown],
             outputs=[server_preview],
         )
         server_preview.select(
@@ -2135,7 +2141,7 @@ def build_ui() -> gr.Blocks:
         )
         server_ref_btn.click(
             _load_server_nominals,
-            inputs=[server_file_explorer, nominal_gallery],
+            inputs=[server_folder_dropdown, nominal_gallery],
             outputs=[nominal_gallery],
         )
 
