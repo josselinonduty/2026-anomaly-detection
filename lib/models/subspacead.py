@@ -300,7 +300,8 @@ class SubspaceAD(nn.Module):
 
         # ── Eigendecomposition ───────────────────────────────────────
         # eigh is not implemented on MPS; run on CPU (cov is small: D×D).
-        cov_cpu = cov.to("cpu", dtype=torch.float64)
+        # Move to CPU first, then cast — MPS cannot convert to float64.
+        cov_cpu = cov.cpu().to(dtype=torch.float64)
         del cov
         eigenvalues, eigenvectors = torch.linalg.eigh(cov_cpu)
         # Sort descending.
