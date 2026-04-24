@@ -56,6 +56,7 @@ _MODULE_CLS: dict[str, type] = {
 }
 
 _CHECKPOINT_ROOT = Path("checkpoints")
+_DATASETS_ROOT = Path("datasets")
 _NO_CHECKPOINT = "(none — fit on-the-fly)"
 
 
@@ -1697,6 +1698,47 @@ def _method_info_html(method_key: str) -> str:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  Server-side image browser helpers
+# ─────────────────────────────────────────────────────────────────────
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _load_server_test_image(
+    selected_files: list[str] | str | None,
+) -> np.ndarray | None:
+    """Load the first selected server-side file as the test image."""
+    if not selected_files:
+        raise gr.Error("Select an image from the server browser first.")
+    path = selected_files[0] if isinstance(selected_files, list) else selected_files
+    full = _DATASETS_ROOT / path
+    if not full.is_file() or full.suffix.lower() not in _IMAGE_EXTS:
+        raise gr.Error(f"Not a valid image: {path}")
+    return _to_rgb_np(full)
+
+
+def _load_server_nominals(
+    selected_files: list[str] | str | None,
+    current_gallery: list | None,
+) -> list:
+    """Append selected server-side files to the nominal gallery."""
+    if not selected_files:
+        raise gr.Error("Select one or more images from the server browser first.")
+    if isinstance(selected_files, str):
+        selected_files = [selected_files]
+    new_images = []
+    for path in selected_files:
+        full = _DATASETS_ROOT / path
+        if full.is_file() and full.suffix.lower() in _IMAGE_EXTS:
+            new_images.append(_to_rgb_np(full))
+    if not new_images:
+        raise gr.Error("No valid images in the selection.")
+    gallery = list(current_gallery) if current_gallery else []
+    gallery.extend(new_images)
+    return gallery
+
+
 def _on_method_change(method_key: str):
     spec = METHODS[method_key]
     gallery_label = (
@@ -1758,6 +1800,27 @@ def build_ui() -> gr.Blocks:
                     file_types=["image"],
                     elem_classes=["iad-gallery"],
                 )
+
+                with gr.Accordion(
+                    "▸ BROWSE SERVER IMAGES", open=False, elem_classes=["iad-accordion"]
+                ):
+                    gr.Markdown(
+                        "Pick images from the host machine's `datasets/` folder."
+                    )
+                    server_file_explorer = gr.FileExplorer(
+                        glob="**/*.{png,jpg,jpeg,bmp,tiff,tif,webp}",
+                        root_dir=str(_DATASETS_ROOT),
+                        file_count="multiple",
+                        label="SERVER IMAGES",
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        server_test_btn = gr.Button(
+                            "↑ USE AS TEST IMAGE", size="sm", scale=1
+                        )
+                        server_ref_btn = gr.Button(
+                            "↑ ADD TO REFERENCES", size="sm", scale=1
+                        )
 
                 gr.HTML('<div class="iad-section-title">03 · METHOD</div>')
                 method_dropdown = gr.Dropdown(
@@ -2019,6 +2082,18 @@ def build_ui() -> gr.Blocks:
                 grp_shared_dino,
                 checkpoint_dropdown,
             ],
+        )
+
+        # ── Server browser wiring ──────────────────────────────────
+        server_test_btn.click(
+            _load_server_test_image,
+            inputs=[server_file_explorer],
+            outputs=[test_image],
+        )
+        server_ref_btn.click(
+            _load_server_nominals,
+            inputs=[server_file_explorer, nominal_gallery],
+            outputs=[nominal_gallery],
         )
 
         run_btn.click(
