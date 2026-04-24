@@ -1705,35 +1705,61 @@ def _method_info_html(method_key: str) -> str:
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 
+def _collect_images_in_dir(folder: Path) -> list[Path]:
+    """Return sorted image paths inside *folder* (non-recursive)."""
+    return sorted(
+        p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+    )
+
+
+def _preview_server_folder(
+    selected_dirs: list[str] | str | None,
+) -> list[str]:
+    """Return image paths for the Gallery preview from the selected folder."""
+    if not selected_dirs:
+        raise gr.Error("Select a folder from the server browser first.")
+    folder = selected_dirs[0] if isinstance(selected_dirs, list) else selected_dirs
+    full = _DATASETS_ROOT / folder
+    if not full.is_dir():
+        raise gr.Error(f"Not a valid directory: {folder}")
+    imgs = _collect_images_in_dir(full)
+    if not imgs:
+        raise gr.Error(f"No images found in {folder}")
+    return [str(p) for p in imgs]
+
+
 def _load_server_test_image(
-    selected_files: list[str] | str | None,
+    evt: gr.SelectData,
 ) -> np.ndarray | None:
-    """Load the first selected server-side file as the test image."""
-    if not selected_files:
-        raise gr.Error("Select an image from the server browser first.")
-    path = selected_files[0] if isinstance(selected_files, list) else selected_files
-    full = _DATASETS_ROOT / path
-    if not full.is_file() or full.suffix.lower() not in _IMAGE_EXTS:
-        raise gr.Error(f"Not a valid image: {path}")
-    return _to_rgb_np(full)
+    """Load the clicked preview image as the test image."""
+    if evt.value is None:
+        raise gr.Error("Click an image in the preview first.")
+    # Gallery select value is a dict with 'image' key containing the file info
+    img_data = evt.value
+    if isinstance(img_data, dict):
+        path = img_data.get("image", {}).get("path", img_data.get("path"))
+    else:
+        path = img_data
+    if not path:
+        raise gr.Error("Could not resolve the selected image.")
+    return _to_rgb_np(path)
 
 
 def _load_server_nominals(
-    selected_files: list[str] | str | None,
+    selected_dirs: list[str] | str | None,
     current_gallery: list | None,
 ) -> list:
-    """Append selected server-side files to the nominal gallery."""
-    if not selected_files:
-        raise gr.Error("Select one or more images from the server browser first.")
-    if isinstance(selected_files, str):
-        selected_files = [selected_files]
-    new_images = []
-    for path in selected_files:
-        full = _DATASETS_ROOT / path
-        if full.is_file() and full.suffix.lower() in _IMAGE_EXTS:
-            new_images.append(_to_rgb_np(full))
-    if not new_images:
-        raise gr.Error("No valid images in the selection.")
+    """Append all images from the selected server folder to the nominal gallery."""
+    if not selected_dirs:
+        raise gr.Error("Select a folder from the server browser first.")
+    folder = selected_dirs[0] if isinstance(selected_dirs, list) else selected_dirs
+    full = _DATASETS_ROOT / folder
+    if not full.is_dir():
+        raise gr.Error(f"Not a valid directory: {folder}")
+    imgs = _collect_images_in_dir(full)
+    if not imgs:
+        raise gr.Error(f"No images found in {folder}")
+    new_images = [_to_rgb_np(p) for p in imgs]
     gallery = list(current_gallery) if current_gallery else []
     gallery.extend(new_images)
     return gallery
@@ -1805,22 +1831,34 @@ def build_ui() -> gr.Blocks:
                     "▸ BROWSE SERVER IMAGES", open=False, elem_classes=["iad-accordion"]
                 ):
                     gr.Markdown(
-                        "Pick images from the host machine's `datasets/` folder."
+                        "Navigate to a folder on the server, then preview "
+                        "its images. Click a preview thumbnail to use it as "
+                        "test image, or load the whole folder as references."
                     )
                     server_file_explorer = gr.FileExplorer(
-                        glob="**/*.{png,jpg,jpeg,bmp,tiff,tif,webp}",
+                        glob="**/",
                         root_dir=str(_DATASETS_ROOT),
-                        file_count="multiple",
-                        label="SERVER IMAGES",
+                        file_count="single",
+                        label="SERVER FOLDERS",
                         interactive=True,
                     )
-                    with gr.Row():
-                        server_test_btn = gr.Button(
-                            "↑ USE AS TEST IMAGE", size="sm", scale=1
-                        )
-                        server_ref_btn = gr.Button(
-                            "↑ ADD TO REFERENCES", size="sm", scale=1
-                        )
+                    server_preview_btn = gr.Button(
+                        "PREVIEW FOLDER",
+                        size="sm",
+                    )
+                    server_preview = gr.Gallery(
+                        label="SERVER PREVIEW (click to use as test image)",
+                        columns=6,
+                        rows=2,
+                        height="auto",
+                        allow_preview=True,
+                        object_fit="cover",
+                        interactive=False,
+                    )
+                    server_ref_btn = gr.Button(
+                        "↑ ADD ALL TO REFERENCES",
+                        size="sm",
+                    )
 
                 gr.HTML('<div class="iad-section-title">03 · METHOD</div>')
                 method_dropdown = gr.Dropdown(
@@ -2085,9 +2123,14 @@ def build_ui() -> gr.Blocks:
         )
 
         # ── Server browser wiring ──────────────────────────────────
-        server_test_btn.click(
-            _load_server_test_image,
+        server_preview_btn.click(
+            _preview_server_folder,
             inputs=[server_file_explorer],
+            outputs=[server_preview],
+        )
+        server_preview.select(
+            _load_server_test_image,
+            inputs=None,
             outputs=[test_image],
         )
         server_ref_btn.click(
