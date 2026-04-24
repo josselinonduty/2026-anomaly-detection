@@ -23,7 +23,7 @@ from pathlib import Path
 def make_checkpoint_dir(
     root: str | Path,
     model_name: str,
-    category: str,
+    category: str | list[str],
 ) -> Path:
     """Create and return a timestamped checkpoint directory.
 
@@ -33,7 +33,8 @@ def make_checkpoint_dir(
         ``<root>/<model_name>/<category>/<YYYYMMDD_HHMMSS>/``
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_dir = Path(root) / model_name / category / timestamp
+    cat_label = "+".join(category) if isinstance(category, list) else category
+    ckpt_dir = Path(root) / model_name / cat_label / timestamp
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     return ckpt_dir
 
@@ -42,7 +43,7 @@ def save_metadata(
     ckpt_dir: Path,
     *,
     model_name: str,
-    category: str,
+    category: str | list[str],
     extra: dict | None = None,
 ) -> None:
     """Write a small JSON sidecar with human-readable run info."""

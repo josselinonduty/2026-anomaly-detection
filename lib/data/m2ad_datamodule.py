@@ -104,7 +104,7 @@ class M2ADDataModule:
     def __init__(
         self,
         dataset_root: str | Path = "datasets/m2ad",
-        category: str = "Bird",
+        category: str | list[str] = "Bird",
         image_size: int = 256,
         batch_size: int = 32,
         num_workers: int = 4,
@@ -138,27 +138,30 @@ class M2ADDataModule:
         return sorted(p for p in directory.rglob("*") if p.suffix.lower() in exts)
 
     def _build_samples(self) -> tuple[list[dict], list[dict]]:
-        """Return (normal_samples, anomalous_samples) for the category."""
-        cat_dir = self.dataset_root / self.category
-
-        good_dir = cat_dir / "Good"
-        ng_dir = cat_dir / "NG"
-        gt_dir = cat_dir / "GT"
-
+        """Return (normal_samples, anomalous_samples) for the category/categories."""
+        categories = (
+            self.category if isinstance(self.category, list) else [self.category]
+        )
         normal_samples: list[dict] = []
-        for img_path in self._scan_images(good_dir):
-            normal_samples.append(
-                {"image_path": img_path, "label": 0, "mask_path": None}
-            )
-
         anomalous_samples: list[dict] = []
-        for img_path in self._scan_images(ng_dir):
-            # Mask mirrors NG structure under GT/
-            rel = img_path.relative_to(ng_dir)
-            mask_path = gt_dir / rel
-            anomalous_samples.append(
-                {"image_path": img_path, "label": 1, "mask_path": mask_path}
-            )
+
+        for cat in categories:
+            cat_dir = self.dataset_root / cat
+            good_dir = cat_dir / "Good"
+            ng_dir = cat_dir / "NG"
+            gt_dir = cat_dir / "GT"
+
+            for img_path in self._scan_images(good_dir):
+                normal_samples.append(
+                    {"image_path": img_path, "label": 0, "mask_path": None}
+                )
+
+            for img_path in self._scan_images(ng_dir):
+                rel = img_path.relative_to(ng_dir)
+                mask_path = gt_dir / rel
+                anomalous_samples.append(
+                    {"image_path": img_path, "label": 1, "mask_path": mask_path}
+                )
 
         return normal_samples, anomalous_samples
 
@@ -170,10 +173,13 @@ class M2ADDataModule:
         normal_samples, anomalous_samples = self._build_samples()
 
         if not normal_samples:
-            cat_dir = self.dataset_root / self.category
+            categories = (
+                self.category if isinstance(self.category, list) else [self.category]
+            )
+            cat_dirs = ", ".join(str(self.dataset_root / c) for c in categories)
             raise FileNotFoundError(
                 f"No images found for category '{self.category}' under "
-                f"{cat_dir}. Download the M2AD dataset from "
+                f"{cat_dirs}. Download the M2AD dataset from "
                 f"https://huggingface.co/datasets/ChengYuQi99/M2AD and "
                 f"extract it into {self.dataset_root}."
             )

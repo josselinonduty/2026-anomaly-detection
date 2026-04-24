@@ -9,6 +9,8 @@ from __future__ import annotations
 import torch
 from pytorch_lightning.accelerators import Accelerator
 
+__all__ = ["XPUAccelerator"]
+
 
 class XPUAccelerator(Accelerator):
     """Lightning accelerator for Intel XPU devices."""

@@ -30,7 +30,7 @@ def create_datamodule(
     dataset: str,
     *,
     dataset_root: str | None = None,
-    category: str = "",
+    category: str | list[str] = "",
     image_size: int = 256,
     batch_size: int = 32,
     num_workers: int = 4,

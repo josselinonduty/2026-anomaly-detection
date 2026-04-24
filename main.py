@@ -4,12 +4,14 @@ Usage
 -----
     python main.py --model dictas --category candle --k_shot 4
     python main.py --model patchcore --category candle
+    python main.py --model patchcore --category all
     python main.py --help
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 from pathlib import Path
 
@@ -25,8 +27,6 @@ from lib.accelerators import XPUAccelerator
 from lib.data import (
     DATASET_NAMES,
     create_datamodule,
-    get_dinomaly_mask_transforms,
-    get_dinomaly_transforms,
 )
 from lib.lightning import (
     AnomalyDINOModule,
@@ -34,7 +34,6 @@ from lib.lightning import (
     AnomalyTIPSv2Module,
     AutoencoderModule,
     DictASModule,
-    DinomalyModule,
     EfficientAdModule,
     FeatureMatchModule,
     PatchCoreModule,
@@ -57,7 +56,17 @@ def parse_args() -> argparse.Namespace:
         help="Dataset to use (default: visa).",
     )
     parser.add_argument("--dataset_root", type=str, default=None)
-    parser.add_argument("--category", type=str, default="candle")
+    parser.add_argument(
+        "--category",
+        type=str,
+        default="all",
+        help=(
+            "Category/categories to train on. Accepts a single category "
+            "(e.g. 'candle'), a comma-separated list (e.g. 'candle,capsules'), "
+            "or 'all' (default) for every category in the dataset. "
+            "Per-class models iterate and train one model per category."
+        ),
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -70,7 +79,6 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "autoencoder",
             "patchcore",
-            "dinomaly",
             "efficientad",
             "anomalydino",
             "anomalyeupe",
@@ -98,31 +106,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=9,
         help="Neighbours for image-score re-weighting (PatchCore).",
-    )
-
-    # Dinomaly-specific
-    parser.add_argument(
-        "--backbone",
-        type=str,
-        default="dinov2reg_vit_base_14",
-        choices=[
-            "dinov2reg_vit_small_14",
-            "dinov2reg_vit_base_14",
-            "dinov2reg_vit_large_14",
-        ],
-        help="DINOv2 backbone for Dinomaly.",
-    )
-    parser.add_argument(
-        "--total_iters",
-        type=int,
-        default=10000,
-        help="Total training iterations (Dinomaly).",
-    )
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=0.2,
-        help="Bottleneck dropout rate (Dinomaly).",
     )
 
     # EfficientAd-specific
@@ -368,15 +351,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+# No models currently support unified multi-class training.
+MULTI_CLASS_MODELS: set[str] = set()
+
+
+def _resolve_categories(args: argparse.Namespace) -> list[str]:
+    """Turn the raw ``--category`` string into a list of category names.
+
+    * ``"all"`` or ``""`` → every category in the dataset
+    * comma-separated → split into a list
+    * single name → ``[name]``
+    """
+    raw = args.category.strip().lower()
+    if raw in ("all", ""):
+        # Need a temporary datamodule just to list available categories.
+        dm = create_datamodule(args.dataset, dataset_root=args.dataset_root)
+        return dm.categories
+    return [c.strip() for c in args.category.split(",") if c.strip()]
+
+
+def train_single(
+    args: argparse.Namespace,
+    category: str | list[str],
+) -> None:
+    """Run a full train + test cycle for *category* (str or list for multi-class)."""
+
+    cat_label = "+".join(category) if isinstance(category, list) else category
 
     # ── MLflow setup ─────────────────────────────────────────────────
     mlflow.set_tracking_uri(args.tracking_uri)
     mlflow_logger = MLFlowLogger(
         experiment_name=args.experiment_name,
         tracking_uri=args.tracking_uri,
-        run_name=f"{args.model}-{args.category}",
+        run_name=f"{args.model}-{cat_label}",
         log_model=True,
         save_dir="mlruns",
     )
@@ -384,27 +391,18 @@ def main() -> None:
     # ── CodeCarbon tracker ───────────────────────────────────────────
     Path("logs").mkdir(exist_ok=True)
     emissions_tracker = EmissionsTracker(
-        project_name=f"{args.experiment_name}/{args.model}/{args.category}",
+        project_name=f"{args.experiment_name}/{args.model}/{cat_label}",
         output_dir="logs",
         log_level="warning",
     )
 
     # ── DataModule ───────────────────────────────────────────────────
     extra_dm_kwargs: dict = {}
-    if args.model == "dinomaly":
-        dinomaly_transform = get_dinomaly_transforms()
-        dinomaly_mask_transform = get_dinomaly_mask_transforms()
-        extra_dm_kwargs.update(
-            train_transform=dinomaly_transform,
-            eval_transform=dinomaly_transform,
-            mask_transform=dinomaly_mask_transform,
-        )
-        args.batch_size = min(args.batch_size, 16)  # paper default
 
     datamodule = create_datamodule(
         args.dataset,
         dataset_root=args.dataset_root,
-        category=args.category,
+        category=category,
         image_size=args.image_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -414,7 +412,6 @@ def main() -> None:
     # ── Model ────────────────────────────────────────────────────────
     model: (
         PatchCoreModule
-        | DinomalyModule
         | EfficientAdModule
         | AutoencoderModule
         | AnomalyDINOModule
@@ -432,19 +429,6 @@ def main() -> None:
             image_size=args.image_size,
         )
         args.max_epochs = 1
-    elif args.model == "dinomaly":
-        args.image_size = 392
-        model = DinomalyModule(
-            backbone=args.backbone,
-            dropout=args.dropout,
-            total_iters=args.total_iters,
-        )
-        datamodule.image_size = args.image_size
-        datamodule.batch_size = args.batch_size
-        datamodule.setup("fit")
-        steps_per_epoch = len(datamodule.train_dataloader())
-        if args.max_epochs is None:
-            args.max_epochs = int(math.ceil(args.total_iters / steps_per_epoch))
     elif args.model == "efficientad":
         args.batch_size = 1
         datamodule.batch_size = args.batch_size
@@ -485,7 +469,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=args.smaller_edge_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -514,7 +498,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=eupe_image_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -532,6 +516,9 @@ def main() -> None:
     elif args.model == "winclip":
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
+        assert isinstance(
+            category, str
+        ), "WinCLIP requires a single category for text prompts."
         winclip_image_size = 240
         winclip_transform = get_eval_transforms(winclip_image_size)
         winclip_mask_transform = get_mask_transforms(winclip_image_size)
@@ -543,7 +530,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=winclip_image_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -551,7 +538,7 @@ def main() -> None:
         )
         args.image_size = winclip_image_size
         model = WinCLIPModule(
-            category=args.category,
+            category=category,
             backbone=args.clip_backbone,
             pretrained=args.clip_pretrained,
             scales=(2, 3),
@@ -563,6 +550,9 @@ def main() -> None:
         # DictAS: CLIP ViT-L/14-336 at 336×336 (Appendix A.4).
         from lib.data.transforms import get_eval_transforms, get_mask_transforms
 
+        assert isinstance(
+            category, str
+        ), "DictAS requires a single category for text prompts."
         dictas_image_size = 336
         dictas_transform = get_eval_transforms(dictas_image_size)
         dictas_mask_transform = get_mask_transforms(dictas_image_size)
@@ -574,7 +564,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=dictas_image_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -582,7 +572,7 @@ def main() -> None:
         )
         args.image_size = dictas_image_size
         model = DictASModule(
-            category=args.category,
+            category=category,
             backbone=args.dictas_backbone,
             pretrained=args.dictas_pretrained,
             image_size=dictas_image_size,
@@ -610,7 +600,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=subspacead_resolution,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -639,7 +629,7 @@ def main() -> None:
         datamodule = create_datamodule(
             args.dataset,
             dataset_root=args.dataset_root,
-            category=args.category,
+            category=category,
             image_size=args.smaller_edge_size,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
@@ -717,12 +707,12 @@ def main() -> None:
         datamodule.setup("fit")
         trainer.fit(model, datamodule.train_dataloader(), datamodule.val_dataloader())
 
-        ckpt_dir = make_checkpoint_dir("checkpoints", args.model, args.category)
+        ckpt_dir = make_checkpoint_dir("checkpoints", args.model, category)
         model.save_checkpoint(ckpt_dir)
         save_metadata(
             ckpt_dir,
             model_name=args.model,
-            category=args.category,
+            category=category,
             extra={k: str(v) for k, v in vars(args).items()},
         )
 
@@ -733,9 +723,26 @@ def main() -> None:
         if emissions is not None:
             mlflow_logger.log_metrics({"carbon/emissions_kg": emissions})
 
-    print(f"\n✓ Training complete for category '{args.category}'.")
+    print(f"\n✓ Training complete for category '{cat_label}'.")
     print(f"  Checkpoint saved to: {ckpt_dir.resolve()}")
     print(f"  MLflow UI: mlflow ui --backend-store-uri {args.tracking_uri}")
+
+
+def main() -> None:
+    args = parse_args()
+    categories = _resolve_categories(args)
+
+    if args.model in MULTI_CLASS_MODELS and len(categories) > 1:
+        # Multi-class models train a single unified model on all categories.
+        print(f"[multi-class] Training unified {args.model} on {categories}")
+        train_single(args, categories)
+    else:
+        # Per-class models iterate and train one model per category.
+        for i, cat in enumerate(categories, 1):
+            print(f"\n{'='*60}")
+            print(f"[{i}/{len(categories)}] Training {args.model} on '{cat}'")
+            print(f"{'='*60}")
+            train_single(copy.deepcopy(args), cat)
 
 
 if __name__ == "__main__":

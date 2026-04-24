@@ -2,7 +2,6 @@ from .anomalydino_module import AnomalyDINOModule
 from .anomalyeupe_module import AnomalyEUPEModule
 from .anomalytipsv2_module import AnomalyTIPSv2Module
 from .dictas_module import DictASModule
-from .dinomaly_module import DinomalyModule
 from .autoencoder_module import AutoencoderModule
 from .efficientad_module import EfficientAdModule
 from .feature_match_module import FeatureMatchModule
@@ -16,7 +15,6 @@ __all__ = [
     "AnomalyTIPSv2Module",
     "AutoencoderModule",
     "DictASModule",
-    "DinomalyModule",
     "EfficientAdModule",
     "FeatureMatchModule",
     "PatchCoreModule",

@@ -24,8 +24,6 @@ import torch.nn.functional as F
 from lib.data import (
     DATASET_NAMES,
     create_datamodule,
-    get_dinomaly_mask_transforms,
-    get_dinomaly_transforms,
 )
 from lib.data.transforms import get_eval_transforms, get_mask_transforms
 from lib.lightning import (
@@ -34,7 +32,6 @@ from lib.lightning import (
     AnomalyTIPSv2Module,
     AutoencoderModule,
     DictASModule,
-    DinomalyModule,
     EfficientAdModule,
     FeatureMatchModule,
     PatchCoreModule,
@@ -50,7 +47,6 @@ _STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 _LOADER_MAP = {
     "autoencoder": AutoencoderModule,
     "patchcore": PatchCoreModule,
-    "dinomaly": DinomalyModule,
     "efficientad": EfficientAdModule,
     "anomalydino": AnomalyDINOModule,
     "anomalyeupe": AnomalyEUPEModule,
@@ -87,7 +83,6 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "autoencoder",
             "patchcore",
-            "dinomaly",
             "efficientad",
             "anomalydino",
             "anomalyeupe",
@@ -163,17 +158,6 @@ def _predict_patchcore(model: PatchCoreModule, images: torch.Tensor) -> torch.Te
     """Return (B, H, W) anomaly maps."""
     _, anomaly_maps = model.model.predict(images)
     return anomaly_maps
-
-
-@torch.no_grad()
-def _predict_dinomaly(model: DinomalyModule, images: torch.Tensor) -> torch.Tensor:
-    """Return (B, H, W) anomaly maps."""
-    en, de = model.model(images)
-    anomaly_map = model._compute_anomaly_map(en, de, out_size=images.shape[-1])
-    anomaly_map = F.conv2d(
-        anomaly_map, model._gaussian_weight, padding=model._gaussian_padding
-    )
-    return anomaly_map[:, 0]
 
 
 @torch.no_grad()
@@ -260,7 +244,6 @@ def _predict_feature_match(
 _PREDICT_FN = {
     "autoencoder": _predict_autoencoder,
     "patchcore": _predict_patchcore,
-    "dinomaly": _predict_dinomaly,
     "efficientad": _predict_efficientad,
     "anomalydino": _predict_anomalydino,
     "anomalyeupe": _predict_anomalyeupe,
@@ -356,14 +339,7 @@ def main() -> None:
     # ── DataModule ───────────────────────────────────────────────────
     extra_dm_kwargs: dict = {}
     image_size = args.image_size
-    if args.model == "dinomaly":
-        extra_dm_kwargs.update(
-            train_transform=get_dinomaly_transforms(),
-            eval_transform=get_dinomaly_transforms(),
-            mask_transform=get_dinomaly_mask_transforms(),
-        )
-        image_size = 392
-    elif args.model == "anomalydino":
+    if args.model == "anomalydino":
         image_size = 448
         extra_dm_kwargs.update(
             train_transform=get_eval_transforms(image_size),

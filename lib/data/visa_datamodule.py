@@ -87,7 +87,7 @@ class VisADataModule:
     def __init__(
         self,
         dataset_root: str | Path = "datasets/visa",
-        category: str = "candle",
+        category: str | list[str] = "candle",
         image_size: int = 256,
         batch_size: int = 32,
         num_workers: int = 4,
@@ -117,7 +117,10 @@ class VisADataModule:
     def setup(self, stage: str | None = None) -> None:
         csv_path = self.dataset_root / self.split_csv
         df = pd.read_csv(csv_path)
-        df = df[df["object"] == self.category]
+        if isinstance(self.category, list):
+            df = df[df["object"].isin(self.category)]
+        else:
+            df = df[df["object"] == self.category]
 
         train_df = df[df["split"] == "train"]
         test_df = df[df["split"] == "test"]
